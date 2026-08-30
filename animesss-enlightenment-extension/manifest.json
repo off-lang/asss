@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Animesss Просветление",
-  "version": "2.1.1",
+  "version": "2.2.2",
   "description": "Показывает спрос карточек, проверяет «Просветление» и поддерживает авто-лут, авто-кристалл и массовый обмен.",
   "permissions": ["storage"],
   "content_scripts": [

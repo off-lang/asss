@@ -602,6 +602,69 @@ function createChatCrystalToggle({ button, controller, log }) {
   return { initialize, toggle };
 }
 
+function createCardStatsToggle({
+  button,
+  storage,
+  coordinator,
+  getCards,
+  setVisible,
+  log,
+}) {
+  const storageKey = 'animesssCardHelper.statsEnabled';
+  let enabled = true;
+  let busy = false;
+
+  function render() {
+    button.setAttribute('aria-pressed', String(enabled));
+    button.textContent = `Спрос карт: ${enabled ? 'включён' : 'выключен'}`;
+  }
+
+  async function apply(value, loadCards) {
+    enabled = value === true;
+    coordinator.setEnabled(enabled);
+    setVisible(enabled);
+    render();
+    if (enabled && loadCards) await coordinator.process(getCards());
+    return enabled;
+  }
+
+  async function initialize() {
+    button.disabled = true;
+    try {
+      const saved = await storage.get(storageKey);
+      await apply(!saved || saved[storageKey] !== false, true);
+    } catch (error) {
+      log.error('Не удалось инициализировать показ спроса:', error);
+    } finally {
+      button.disabled = false;
+      render();
+    }
+    return enabled;
+  }
+
+  async function toggle() {
+    if (busy) return enabled;
+    busy = true;
+    button.disabled = true;
+    try {
+      const next = !enabled;
+      await storage.set({ [storageKey]: next });
+      return await apply(next, next);
+    } catch (error) {
+      log.error('Не удалось изменить показ спроса:', error);
+      return enabled;
+    } finally {
+      busy = false;
+      button.disabled = false;
+      render();
+    }
+  }
+
+  button.addEventListener('click', toggle);
+  render();
+  return { initialize, toggle };
+}
+
 function createMassTradeAction({
   button,
   collectCandidates,
@@ -732,6 +795,11 @@ function mountUi(doc) {
     'Обновить спрос видимых карточек',
   );
 
+  const statsToggleButton = doc.createElement('button');
+  statsToggleButton.type = 'button';
+  statsToggleButton.className = 'animesss-card-helper-action';
+  statsToggleButton.setAttribute('aria-label', 'Переключить показ спроса карт');
+
   const autoLootButton = doc.createElement('button');
   autoLootButton.type = 'button';
   autoLootButton.className = 'animesss-card-helper-action';
@@ -756,6 +824,7 @@ function mountUi(doc) {
   actions.append(
     enlightenmentButton,
     refreshButton,
+    statsToggleButton,
     autoLootButton,
     autoCrystalButton,
     tradeButton,
@@ -820,6 +889,7 @@ function mountUi(doc) {
     button,
     enlightenmentButton,
     refreshButton,
+    statsToggleButton,
     autoLootButton,
     autoCrystalButton,
     tradeButton,
@@ -897,6 +967,24 @@ function mountExtension() {
       instanceStore,
       render: renderCardStats,
     });
+    coordinator.setEnabled(false);
+    const getStatsCards = () => [
+      ...document.querySelectorAll(cardHelper.CARD_SELECTOR),
+    ];
+    const statsToggle = createCardStatsToggle({
+      button: ui.statsToggleButton,
+      storage: chrome.storage.local,
+      coordinator,
+      getCards: getStatsCards,
+      setVisible: (enabled) => {
+        document.body.classList.toggle(
+          'animesss-card-stats-disabled',
+          !enabled,
+        );
+        ui.refreshButton.disabled = !enabled;
+      },
+      log: window.console,
+    });
     const autoLootController = cardHelper.createAutoLootController({
       fetch: window.fetch.bind(window),
       storage: chrome.storage.local,
@@ -941,14 +1029,14 @@ function mountExtension() {
     createStatsActions({
       refreshButton: ui.refreshButton,
       clearButton: ui.clearCacheButton,
-      getCards: () => [...document.querySelectorAll(cardHelper.CARD_SELECTOR)],
+      getCards: getStatsCards,
       coordinator,
       cache: statsCache,
       notify: ui.notify,
       log: window.console,
     });
 
-    void instanceStore.initialize().then(() => {
+    void instanceStore.initialize().then(async () => {
       const observer = cardHelper.createCardObserver({
         root: document.body,
         selector: cardHelper.CARD_SELECTOR,
@@ -960,7 +1048,7 @@ function mountExtension() {
         },
         Observer: window.MutationObserver,
       });
-      observer.scan();
+      await statsToggle.initialize();
     }).catch((error) => {
       window.console.error('Не удалось запустить Card Helper:', error);
     });
@@ -980,6 +1068,7 @@ if (typeof module === 'object' && module.exports) {
     createCardStatsRenderer,
     createAutoLootToggle,
     createChatCrystalToggle,
+    createCardStatsToggle,
     createMassTradeAction,
     createStatsActions,
     createPersistentActivation,

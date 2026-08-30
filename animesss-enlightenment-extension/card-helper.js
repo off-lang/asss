@@ -68,6 +68,11 @@
     return String(value || '').replace(/\s+/g, ' ').trim();
   }
 
+  function isExtensionContextInvalidated(error) {
+    return String(error && error.message || error || '')
+      .includes('Extension context invalidated');
+  }
+
   function parseCounter(doc, selector, fallback) {
     const element = doc && typeof doc.querySelector === 'function'
       ? doc.querySelector(selector)
@@ -204,6 +209,8 @@
     sleep,
   }) {
     const inFlight = new Map();
+    let requestTail = Promise.resolve();
+    let hasRequested = false;
 
     function endpoint(path, cardId) {
       const url = new URL(path, origin);
@@ -211,14 +218,38 @@
       return url.href;
     }
 
-    async function requestDocument(url) {
+    function queuedFetch(url, shouldContinue) {
+      const pending = requestTail.then(async () => {
+        if (!shouldContinue()) throw new Error('Card stats request cancelled');
+        if (hasRequested) await sleep(350);
+        if (!shouldContinue()) throw new Error('Card stats request cancelled');
+        hasRequested = true;
+        return fetch(url);
+      });
+      requestTail = pending.catch(() => {});
+      return pending;
+    }
+
+    function retryAfterMs(response) {
+      const raw = response && response.headers &&
+        typeof response.headers.get === 'function'
+        ? response.headers.get('Retry-After')
+        : null;
+      const seconds = Number.parseInt(String(raw || ''), 10);
+      return Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : null;
+    }
+
+    async function requestDocument(url, shouldContinue) {
       let lastError = null;
       for (let attempt = 1; attempt <= 3; attempt += 1) {
         try {
-          const response = await fetch(url);
+          const response = await queuedFetch(url, shouldContinue);
           if (!response.ok) {
             const error = new Error(`HTTP ${response.status}: ${url}`);
             error.retryable = response.status === 429 || response.status >= 500;
+            if (response.status === 429) {
+              error.retryAfterMs = retryAfterMs(response);
+            }
             throw error;
           }
           return parseHtml(await response.text());
@@ -226,24 +257,29 @@
           lastError = error;
           const retryable = error instanceof TypeError || error.retryable === true;
           if (!retryable || attempt === 3) break;
-          await sleep(attempt * 1000);
+          await sleep(error.retryAfterMs ?? attempt * 1000);
         }
       }
       throw lastError;
     }
 
-    async function fetchStats(cardId) {
+    async function fetchStats(cardId, shouldContinue) {
       const mainDoc = await requestDocument(
         endpoint('/cards/users/', cardId),
+        shouldContinue,
       );
       const stats = parseStats(mainDoc, origin);
       for (const [kind, path] of [
         ['need', '/cards/users/need/'],
         ['trade', '/cards/users/trade/'],
       ]) {
+        if (!shouldContinue()) throw new Error('Card stats request cancelled');
         if (stats.users[kind].length > 0) continue;
         try {
-          const listDoc = await requestDocument(endpoint(path, cardId));
+          const listDoc = await requestDocument(
+            endpoint(path, cardId),
+            shouldContinue,
+          );
           stats.users[kind] = parseStats(listDoc, origin).users.owners;
         } catch (_error) {
           stats.users[kind] = [];
@@ -253,7 +289,11 @@
       return { status: 'ready', ...stats };
     }
 
-    async function load(cardId, { force = false } = {}) {
+    async function load(
+      cardId,
+      { force = false } = {},
+      shouldContinue = () => true,
+    ) {
       const normalizedId = numericId(cardId);
       if (!normalizedId) {
         return {
@@ -272,7 +312,7 @@
       }
       if (inFlight.has(normalizedId)) return inFlight.get(normalizedId);
 
-      const pending = fetchStats(normalizedId)
+      const pending = fetchStats(normalizedId, shouldContinue)
         .catch(() => ({
           status: 'error',
           ownersCount: null,
@@ -333,17 +373,35 @@
   }
 
   function createCardStatsCoordinator({ client, instanceStore, render }) {
+    let enabled = true;
+    let generation = 0;
+
     async function process(cards, { force = false } = {}) {
+      if (!enabled) return;
+      const currentGeneration = generation;
       const uniqueCards = [...new Set(cards || [])];
       await instanceStore.remember(uniqueCards);
-      await Promise.all(uniqueCards.map(async (card) => {
+      for (const card of uniqueCards) {
+        const shouldContinue = () =>
+          enabled && generation === currentGeneration;
+        if (!shouldContinue()) break;
         const cardId = getCanonicalCardId(card, instanceStore.lookup);
-        if (!cardId) return;
-        const result = await client.load(cardId, { force });
+        if (!cardId) continue;
+        const result = await client.load(cardId, { force }, shouldContinue);
+        if (!shouldContinue()) break;
         render(card, result);
-      }));
+      }
     }
-    return { process };
+
+    function setEnabled(value) {
+      const next = value === true;
+      if (enabled === next) return enabled;
+      enabled = next;
+      generation += 1;
+      return enabled;
+    }
+
+    return { process, setEnabled, isEnabled: () => enabled };
   }
 
   function extractUserHash(doc) {
@@ -407,18 +465,18 @@
 
     async function runNow() {
       if (!enabled || inFlight) return false;
-      const hour = new Date(now()).toISOString().slice(0, 13);
-      const saved = await storage.get(hourKey);
-      if (saved && saved[hourKey] === hour) return false;
-
-      const userHash = getUserHash();
-      if (!userHash) {
-        notify('error', 'Не удалось определить user_hash для авто-лута.');
-        return false;
-      }
-
       inFlight = true;
       try {
+        const hour = new Date(now()).toISOString().slice(0, 13);
+        const saved = await storage.get(hourKey);
+        if (saved && saved[hourKey] === hour) return false;
+
+        const userHash = getUserHash();
+        if (!userHash) {
+          notify('error', 'Не удалось определить user_hash для авто-лута.');
+          return false;
+        }
+
         const response = await fetch('/ajax/card_for_watch/', {
           method: 'POST',
           credentials: 'same-origin',
@@ -436,7 +494,11 @@
           await storage.set({ [hourKey]: hour });
         }
         return true;
-      } catch (_error) {
+      } catch (error) {
+        if (isExtensionContextInvalidated(error)) {
+          stop();
+          return false;
+        }
         notify('error', 'Ошибка автоматического сбора карточки.');
         return false;
       } finally {
@@ -546,9 +608,20 @@
         if (returnButton) returnButton.click();
         await scan();
         return true;
+      } catch (error) {
+        if (isExtensionContextInvalidated(error)) {
+          stop();
+          return false;
+        }
+        throw error;
       } finally {
         inFlight = false;
       }
+    }
+
+    function stop() {
+      enabled = false;
+      stopTimer();
     }
 
     async function initialize() {
@@ -589,6 +662,7 @@
       setEnabled,
       scan,
       runNow,
+      stop,
     };
   }
 

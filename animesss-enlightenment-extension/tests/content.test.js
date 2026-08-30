@@ -12,6 +12,7 @@ const {
   createCardStatsRenderer,
   createAutoLootToggle,
   createChatCrystalToggle,
+  createCardStatsToggle,
   createMassTradeAction,
   createStatsActions,
   createPersistentActivation,
@@ -737,6 +738,53 @@ test('auto-crystal toggle initializes disabled and persists clicks', async () =>
   assert.match(button.textContent, /включён/);
 });
 
+test('card stats toggle defaults on, persists changes, and reloads cards when enabled', async () => {
+  assert.equal(typeof createCardStatsToggle, 'function');
+  if (typeof createCardStatsToggle !== 'function') return;
+  let clickHandler;
+  const attributes = {};
+  const button = {
+    disabled: false,
+    textContent: '',
+    setAttribute(name, value) { attributes[name] = String(value); },
+    addEventListener(name, handler) {
+      if (name === 'click') clickHandler = handler;
+    },
+  };
+  const storage = {
+    values: {},
+    async get(key) { return { [key]: this.values[key] }; },
+    async set(value) { Object.assign(this.values, value); },
+  };
+  const enabledStates = [];
+  const visibility = [];
+  let processes = 0;
+  const toggle = createCardStatsToggle({
+    button,
+    storage,
+    coordinator: {
+      setEnabled: (value) => enabledStates.push(value),
+      process: async () => { processes += 1; },
+    },
+    getCards: () => [{ id: '17' }],
+    setVisible: (value) => visibility.push(value),
+    log: console,
+  });
+
+  await toggle.initialize();
+  assert.equal(attributes['aria-pressed'], 'true');
+  assert.equal(processes, 1);
+
+  await clickHandler();
+  assert.equal(storage.values['animesssCardHelper.statsEnabled'], false);
+  assert.equal(visibility.at(-1), false);
+
+  await clickHandler();
+  assert.equal(storage.values['animesssCardHelper.statsEnabled'], true);
+  assert.equal(processes, 2);
+  assert.deepEqual(enabledStates, [true, false, true]);
+});
+
 test('mass trade action requires confirmation and reports final counts', async () => {
   let clickHandler;
   const button = {
@@ -826,6 +874,7 @@ test('mountUi creates a collapsed accessible panel with all card actions', () =>
     [
       'Запустить проверку просветления',
       'Обновить спрос видимых карточек',
+      'Переключить показ спроса карт',
       'Переключить авто-лут',
       'Переключить авто-кристалл',
       'Запустить массовый обмен',

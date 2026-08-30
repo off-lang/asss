@@ -232,10 +232,15 @@ test('createTtlCache clear removes only its own prefixed entries', async () => {
   assert.deepEqual(storage.values, { 'site.setting': true });
 });
 
-function httpResponse(body, status = 200) {
+function httpResponse(body, status = 200, headers = {}) {
   return {
     ok: status >= 200 && status < 300,
     status,
+    headers: {
+      get(name) {
+        return headers[String(name).toLowerCase()] || null;
+      },
+    },
     async text() {
       return body;
     },
@@ -311,7 +316,7 @@ test('card stats client retries a transient 503 and does not retry a permanent 4
 
   assert.equal((await transient.load('17')).status, 'ready');
   assert.equal(transientCalls, 2);
-  assert.deepEqual(waits, [1000]);
+  assert.deepEqual(waits, [1000, 350]);
 
   let permanentCalls = 0;
   const permanent = createCardStatsClient({
@@ -379,6 +384,46 @@ test('card stats client fetches missing need and trade lists without replacing m
   assert.equal(result.tradeCount, 4);
   assert.deepEqual(result.users.need, [needUser]);
   assert.deepEqual(result.users.trade, [tradeUser]);
+});
+
+test('card stats client spaces network requests for about three per second', async () => {
+  const events = [];
+  const client = createCardStatsClient({
+    origin: 'https://animesss.com',
+    fetch: async (url) => {
+      events.push(`fetch:${new URL(url).searchParams.get('id')}`);
+      return httpResponse('MAIN');
+    },
+    parseHtml: (body) => body,
+    parseStats: () => completeStats,
+    cache: valueCache(),
+    sleep: async (ms) => events.push(`sleep:${ms}`),
+  });
+
+  await Promise.all([client.load('17'), client.load('18')]);
+
+  assert.deepEqual(events, ['fetch:17', 'sleep:350', 'fetch:18']);
+});
+
+test('card stats client respects Retry-After after a 429 response', async () => {
+  const waits = [];
+  let calls = 0;
+  const client = createCardStatsClient({
+    origin: 'https://animesss.com',
+    fetch: async () => {
+      calls += 1;
+      return calls === 1
+        ? httpResponse('', 429, { 'retry-after': '5' })
+        : httpResponse('MAIN');
+    },
+    parseHtml: (body) => body,
+    parseStats: () => completeStats,
+    cache: valueCache(),
+    sleep: async (ms) => waits.push(ms),
+  });
+
+  assert.equal((await client.load('17')).status, 'ready');
+  assert.deepEqual(waits, [5000, 350]);
 });
 
 test('createInstanceMap maps owned instance IDs to canonical card IDs', () => {
@@ -523,6 +568,37 @@ test('card stats coordinator renders recognized cards and forwards force refresh
   assert.deepEqual(renders.map(([card]) => card), [regular, remelt]);
 });
 
+test('disabling card stats stops queued cards after the active load', async () => {
+  const first = fakeCard({ className: 'deck__item', attrs: { 'data-id': '17' } });
+  const second = fakeCard({ className: 'deck__item', attrs: { 'data-id': '18' } });
+  let releaseActive;
+  const active = new Promise((resolve) => { releaseActive = resolve; });
+  const loads = [];
+  const renders = [];
+  const coordinator = createCardStatsCoordinator({
+    client: {
+      async load(id) {
+        loads.push(id);
+        if (id === '17') await active;
+        return { status: 'ready', ownersCount: Number(id) };
+      },
+    },
+    instanceStore: { remember: async () => {}, lookup: () => null },
+    render: (card) => renders.push(card),
+  });
+
+  assert.equal(typeof coordinator.setEnabled, 'function');
+  if (typeof coordinator.setEnabled !== 'function') return;
+  const processing = coordinator.process([first, second]);
+  await new Promise((resolve) => setImmediate(resolve));
+  coordinator.setEnabled(false);
+  releaseActive();
+  await processing;
+
+  assert.deepEqual(loads, ['17']);
+  assert.deepEqual(renders, []);
+});
+
 function inlineScriptDocument(scripts) {
   return {
     querySelectorAll(selector) {
@@ -618,6 +694,31 @@ test('auto-loot sends a same-origin encoded POST and observes the hourly limit',
   assert.equal(notices.some(([kind]) => kind === 'error'), false);
 });
 
+test('auto-loot stops quietly when the extension context is invalidated', async () => {
+  let gets = 0;
+  const cleared = [];
+  const controller = createAutoLootController({
+    fetch: async () => httpResponse('{}'),
+    storage: {
+      async get(key) {
+        gets += 1;
+        if (gets === 1) return { [key]: true };
+        throw new Error('Extension context invalidated.');
+      },
+      async set() {},
+    },
+    getUserHash: () => 'abc_123',
+    now: () => Date.parse('2026-08-29T10:15:00Z'),
+    setInterval: () => 7,
+    clearInterval: (id) => cleared.push(id),
+    notify: () => {},
+  });
+  await controller.initialize();
+
+  await assert.doesNotReject(controller.runNow());
+  assert.deepEqual(cleared, [7]);
+});
+
 const CRYSTAL_MESSAGE =
   'Шпион демонической секты отобрал 300 мешков с камнями духа, помогите их собрать';
 
@@ -647,8 +748,12 @@ function returnButton({ text = 'Я ВЕРНУЛСЯ', visible = true } = {}) {
   };
 }
 
-function crystalFixture({ initial = {}, items = [], controls = [] } = {}) {
-  const storage = memoryStorage(initial);
+function crystalFixture({
+  initial = {},
+  items = [],
+  controls = [],
+  storage = memoryStorage(initial),
+} = {}) {
   const root = {
     querySelectorAll(selector) {
       if (selector === '.animesss-chat__item') return items;
@@ -753,6 +858,37 @@ test('auto-crystal stops its three-minute checks when disabled', async () => {
 
   await fixture.timers[0].callback();
   assert.equal(back.getClicks(), 1);
+});
+
+test('auto-crystal stops quietly when the extension context is invalidated', async () => {
+  const items = [];
+  const cleared = [];
+  const storage = {
+    async get(key) {
+      if (key === 'animesssCardHelper.autoCrystalEnabled') {
+        return { [key]: true };
+      }
+      return { [key]: [] };
+    },
+    async set() {
+      throw new Error('Extension context invalidated.');
+    },
+  };
+  const controller = createChatCrystalController({
+    root: {
+      querySelectorAll(selector) {
+        return selector === '.animesss-chat__item' ? items : [];
+      },
+    },
+    storage,
+    setInterval: () => 9,
+    clearInterval: (id) => cleared.push(id),
+  });
+  await controller.initialize();
+  items.push(chatItem());
+
+  await assert.doesNotReject(controller.runNow());
+  assert.deepEqual(cleared, [9]);
 });
 
 function candidateCard({ id, ownerId, locked = false, visible = true } = {}) {
