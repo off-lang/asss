@@ -1,0 +1,163 @@
+#animesss-enlightenment-control {
+  appearance: none;
+  position: fixed;
+  top: 50px;
+  right: 20px;
+  z-index: 2147483647;
+  display: grid;
+  width: 52px;
+  height: 52px;
+  padding: 0;
+  place-items: center;
+  border: 2px solid rgb(255 255 255 / 75%);
+  border-radius: 50%;
+  background: #16833b;
+  box-shadow: 0 5px 18px rgb(0 0 0 / 35%);
+  color: #fff;
+  font: 700 23px/1 system-ui, sans-serif;
+  cursor: pointer;
+  transition: background-color 160ms ease, box-shadow 160ms ease,
+    transform 160ms ease;
+}
+
+#animesss-enlightenment-control:hover:not(:disabled) {
+  background: #106b30;
+  box-shadow: 0 7px 22px rgb(0 0 0 / 45%);
+  transform: translateY(-1px);
+}
+
+#animesss-enlightenment-control:focus-visible {
+  outline: 3px solid #fff;
+  outline-offset: 3px;
+}
+
+#animesss-enlightenment-control.is-starting,
+#animesss-enlightenment-control.is-running {
+  background: #b36b00;
+}
+
+#animesss-enlightenment-control.is-running {
+  animation: animesss-enlightenment-spin 1.15s linear infinite;
+}
+
+#animesss-enlightenment-control.is-completed {
+  background: #315d46;
+  cursor: default;
+  opacity: 0.9;
+}
+
+#animesss-enlightenment-notifications {
+  position: fixed;
+  top: 20px;
+  right: 88px;
+  z-index: 2147483647;
+  display: grid;
+  max-width: min(360px, calc(100vw - 130px));
+  gap: 8px;
+  pointer-events: none;
+}
+
+#animesss-card-helper-actions {
+  position: fixed;
+  top: 112px;
+  right: 20px;
+  z-index: 2147483646;
+  display: grid;
+  width: 170px;
+  gap: 6px;
+}
+
+#animesss-card-helper-actions[hidden] {
+  display: none;
+}
+
+.animesss-card-helper-action {
+  appearance: none;
+  padding: 8px 10px;
+  border: 1px solid rgb(255 255 255 / 28%);
+  border-radius: 7px;
+  background: rgb(20 22 25 / 94%);
+  color: #fff;
+  font: 600 12px/1.3 system-ui, sans-serif;
+  cursor: pointer;
+}
+
+.animesss-card-helper-action[aria-pressed="true"] {
+  border-color: #4fd37a;
+  background: rgb(22 86 48 / 96%);
+}
+
+.animesss-card-helper-action.is-starting,
+.animesss-card-helper-action.is-running {
+  border-color: #f7b955;
+  background: rgb(124 76 8 / 96%);
+}
+
+.animesss-card-helper-action.is-completed {
+  border-color: #4fd37a;
+  background: rgb(32 74 51 / 96%);
+}
+
+.animesss-card-helper-action:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.animesss-enlightenment-notice {
+  padding: 11px 14px;
+  border: 1px solid rgb(255 255 255 / 20%);
+  border-radius: 9px;
+  background: rgb(20 22 25 / 94%);
+  box-shadow: 0 4px 16px rgb(0 0 0 / 30%);
+  color: #fff;
+  font: 500 14px/1.4 system-ui, sans-serif;
+}
+
+.animesss-enlightenment-notice.is-success {
+  border-color: #4fd37a;
+}
+
+.animesss-enlightenment-notice.is-error {
+  border-color: #ff6b6b;
+}
+
+.animesss-enlightenment-card-stats {
+  display: grid;
+  width: 100%;
+  margin-top: 5px;
+  color: var(--tt, #eee);
+  font: 500 11px/1.35 system-ui, sans-serif;
+}
+
+.animesss-enlightenment-card-metrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 3px;
+}
+
+.animesss-enlightenment-card-metric {
+  min-width: 0;
+  padding: 3px 4px;
+  border: 1px solid var(--bdc, rgb(255 255 255 / 18%));
+  border-radius: 5px;
+  background: var(--bg-2, rgb(25 27 31 / 92%));
+  font: 600 11px/1.2 system-ui, sans-serif !important;
+  text-align: center;
+  white-space: normal;
+}
+
+@keyframes animesss-enlightenment-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #animesss-enlightenment-control {
+    transition: none;
+  }
+
+  #animesss-enlightenment-control.is-running {
+    animation: none;
+  }
+}
