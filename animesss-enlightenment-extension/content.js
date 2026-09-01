@@ -602,6 +602,48 @@ function createChatCrystalToggle({ button, controller, log }) {
   return { initialize, toggle };
 }
 
+function createClubBoostToggle({ button, controller, log }) {
+  let enabled = false;
+  let busy = false;
+
+  function render() {
+    button.setAttribute('aria-pressed', String(enabled));
+    button.textContent =
+      `Авто-взнос клуба: ${enabled ? 'включён' : 'выключен'}`;
+  }
+
+  async function initialize() {
+    button.disabled = true;
+    try {
+      enabled = await controller.initialize();
+    } catch (error) {
+      log.error('Не удалось инициализировать авто-взнос клуба:', error);
+    } finally {
+      button.disabled = false;
+      render();
+    }
+  }
+
+  async function toggle() {
+    if (busy) return;
+    busy = true;
+    button.disabled = true;
+    try {
+      enabled = await controller.setEnabled(!enabled);
+    } catch (error) {
+      log.error('Не удалось изменить авто-взнос клуба:', error);
+    } finally {
+      busy = false;
+      button.disabled = false;
+      render();
+    }
+  }
+
+  button.addEventListener('click', toggle);
+  render();
+  return { initialize, toggle };
+}
+
 function createCardStatsToggle({
   button,
   storage,
@@ -657,6 +699,66 @@ function createCardStatsToggle({
       busy = false;
       button.disabled = false;
       render();
+    }
+  }
+
+  button.addEventListener('click', toggle);
+  render();
+  return { initialize, toggle };
+}
+
+function createCardStatsSpeedToggle({ button, storage, client, log }) {
+  const storageKey = 'animesssCardHelper.statsRate';
+  const rates = [1, 3, 5];
+  let rate = 3;
+  let busy = false;
+
+  function label(value) {
+    if (value === 1) return '1 запрос/с';
+    if (value === 3) return '3 запроса/с';
+    return '5 запросов/с';
+  }
+
+  function render() {
+    button.setAttribute('aria-pressed', 'false');
+    button.textContent = `Скорость: ${label(rate)}`;
+  }
+
+  function apply(value) {
+    rate = rates.includes(Number(value)) ? Number(value) : 3;
+    client.setRequestRate(rate);
+    render();
+    return rate;
+  }
+
+  async function initialize() {
+    button.disabled = true;
+    try {
+      const saved = await storage.get(storageKey);
+      apply(saved && saved[storageKey]);
+    } catch (error) {
+      log.error('Не удалось прочитать скорость запросов:', error);
+      apply(3);
+    } finally {
+      button.disabled = false;
+    }
+    return rate;
+  }
+
+  async function toggle() {
+    if (busy) return rate;
+    busy = true;
+    button.disabled = true;
+    try {
+      const next = rates[(rates.indexOf(rate) + 1) % rates.length];
+      await storage.set({ [storageKey]: next });
+      return apply(next);
+    } catch (error) {
+      log.error('Не удалось изменить скорость запросов:', error);
+      return rate;
+    } finally {
+      busy = false;
+      button.disabled = false;
     }
   }
 
@@ -800,6 +902,14 @@ function mountUi(doc) {
   statsToggleButton.className = 'animesss-card-helper-action';
   statsToggleButton.setAttribute('aria-label', 'Переключить показ спроса карт');
 
+  const statsSpeedButton = doc.createElement('button');
+  statsSpeedButton.type = 'button';
+  statsSpeedButton.className = 'animesss-card-helper-action';
+  statsSpeedButton.setAttribute(
+    'aria-label',
+    'Переключить скорость запросов спроса',
+  );
+
   const autoLootButton = doc.createElement('button');
   autoLootButton.type = 'button';
   autoLootButton.className = 'animesss-card-helper-action';
@@ -809,6 +919,11 @@ function mountUi(doc) {
   autoCrystalButton.type = 'button';
   autoCrystalButton.className = 'animesss-card-helper-action';
   autoCrystalButton.setAttribute('aria-label', 'Переключить авто-кристалл');
+
+  const clubBoostButton = doc.createElement('button');
+  clubBoostButton.type = 'button';
+  clubBoostButton.className = 'animesss-card-helper-action';
+  clubBoostButton.setAttribute('aria-label', 'Переключить авто-взнос клуба');
 
   const tradeButton = doc.createElement('button');
   tradeButton.type = 'button';
@@ -825,8 +940,10 @@ function mountUi(doc) {
     enlightenmentButton,
     refreshButton,
     statsToggleButton,
+    statsSpeedButton,
     autoLootButton,
     autoCrystalButton,
+    clubBoostButton,
     tradeButton,
     clearCacheButton,
   );
@@ -890,8 +1007,10 @@ function mountUi(doc) {
     enlightenmentButton,
     refreshButton,
     statsToggleButton,
+    statsSpeedButton,
     autoLootButton,
     autoCrystalButton,
+    clubBoostButton,
     tradeButton,
     clearCacheButton,
     actions,
@@ -962,6 +1081,12 @@ function mountExtension() {
       cache: statsCache,
       sleep: (ms) => new Promise((resolve) => window.setTimeout(resolve, ms)),
     });
+    const statsSpeedToggle = createCardStatsSpeedToggle({
+      button: ui.statsSpeedButton,
+      storage: chrome.storage.local,
+      client: statsClient,
+      log: window.console,
+    });
     const coordinator = cardHelper.createCardStatsCoordinator({
       client: statsClient,
       instanceStore,
@@ -986,13 +1111,10 @@ function mountExtension() {
       log: window.console,
     });
     const autoLootController = cardHelper.createAutoLootController({
-      fetch: window.fetch.bind(window),
+      root: document.body,
       storage: chrome.storage.local,
-      getUserHash: () => cardHelper.extractUserHash(document),
-      now: Date.now,
-      setInterval: window.setInterval.bind(window),
-      clearInterval: window.clearInterval.bind(window),
-      notify: ui.notify,
+      Observer: window.MutationObserver,
+      schedule: (callback) => window.setTimeout(callback, 0),
     });
     const autoLootToggle = createAutoLootToggle({
       button: ui.autoLootButton,
@@ -1012,6 +1134,24 @@ function mountExtension() {
       log: window.console,
     });
     void chatCrystalToggle.initialize();
+    const clubBoostController = cardHelper.createClubBoostController({
+      root: document.body,
+      storage: chrome.storage.local,
+      now: Date.now,
+      setTimeout: window.setTimeout.bind(window),
+      clearTimeout: window.clearTimeout.bind(window),
+      sleep: (ms) => new Promise((resolve) => window.setTimeout(resolve, ms)),
+      notify: ui.notify,
+      isBoostPage: () =>
+        window.location.pathname === '/clubs/boost/' &&
+        new URLSearchParams(window.location.search).get('id') === '402',
+    });
+    const clubBoostToggle = createClubBoostToggle({
+      button: ui.clubBoostButton,
+      controller: clubBoostController,
+      log: window.console,
+    });
+    void clubBoostToggle.initialize();
     const massTradeController = cardHelper.createMassTradeController({
       fetch: window.fetch.bind(window),
       getUserHash: () => cardHelper.extractUserHash(document),
@@ -1048,6 +1188,7 @@ function mountExtension() {
         },
         Observer: window.MutationObserver,
       });
+      await statsSpeedToggle.initialize();
       await statsToggle.initialize();
     }).catch((error) => {
       window.console.error('Не удалось запустить Card Helper:', error);
@@ -1068,7 +1209,9 @@ if (typeof module === 'object' && module.exports) {
     createCardStatsRenderer,
     createAutoLootToggle,
     createChatCrystalToggle,
+    createClubBoostToggle,
     createCardStatsToggle,
+    createCardStatsSpeedToggle,
     createMassTradeAction,
     createStatsActions,
     createPersistentActivation,

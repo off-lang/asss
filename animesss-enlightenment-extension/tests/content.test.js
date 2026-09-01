@@ -12,7 +12,9 @@ const {
   createCardStatsRenderer,
   createAutoLootToggle,
   createChatCrystalToggle,
+  createClubBoostToggle,
   createCardStatsToggle,
+  createCardStatsSpeedToggle,
   createMassTradeAction,
   createStatsActions,
   createPersistentActivation,
@@ -738,6 +740,36 @@ test('auto-crystal toggle initializes disabled and persists clicks', async () =>
   assert.match(button.textContent, /включён/);
 });
 
+test('club boost toggle initializes from persistence and updates pressed state', async () => {
+  let clickHandler;
+  const attributes = {};
+  const button = {
+    disabled: false,
+    textContent: '',
+    setAttribute(name, value) { attributes[name] = String(value); },
+    addEventListener(name, handler) {
+      if (name === 'click') clickHandler = handler;
+    },
+  };
+  const writes = [];
+  const toggle = createClubBoostToggle({
+    button,
+    controller: {
+      async initialize() { return true; },
+      async setEnabled(value) { writes.push(value); return value; },
+    },
+    log: console,
+  });
+
+  await toggle.initialize();
+  assert.equal(attributes['aria-pressed'], 'true');
+  assert.match(button.textContent, /Авто-взнос клуба: включён/);
+  await clickHandler();
+  assert.deepEqual(writes, [false]);
+  assert.equal(attributes['aria-pressed'], 'false');
+  assert.match(button.textContent, /Авто-взнос клуба: выключен/);
+});
+
 test('card stats toggle defaults on, persists changes, and reloads cards when enabled', async () => {
   assert.equal(typeof createCardStatsToggle, 'function');
   if (typeof createCardStatsToggle !== 'function') return;
@@ -783,6 +815,44 @@ test('card stats toggle defaults on, persists changes, and reloads cards when en
   assert.equal(storage.values['animesssCardHelper.statsEnabled'], true);
   assert.equal(processes, 2);
   assert.deepEqual(enabledStates, [true, false, true]);
+});
+
+test('card stats speed toggle defaults to 3 and cycles through 5 and 1', async () => {
+  assert.equal(typeof createCardStatsSpeedToggle, 'function');
+  if (typeof createCardStatsSpeedToggle !== 'function') return;
+  let clickHandler;
+  const attributes = {};
+  const button = {
+    disabled: false,
+    textContent: '',
+    setAttribute(name, value) { attributes[name] = String(value); },
+    addEventListener(name, handler) {
+      if (name === 'click') clickHandler = handler;
+    },
+  };
+  const values = {};
+  const storage = {
+    async get(key) { return { [key]: values[key] }; },
+    async set(value) { Object.assign(values, value); },
+  };
+  const rates = [];
+  const toggle = createCardStatsSpeedToggle({
+    button,
+    storage,
+    client: { setRequestRate: (rate) => rates.push(rate) },
+    log: console,
+  });
+
+  await toggle.initialize();
+  assert.match(button.textContent, /3 запроса\/с/);
+  assert.equal(attributes['aria-pressed'], 'false');
+  await clickHandler();
+  assert.match(button.textContent, /5 запросов\/с/);
+  await clickHandler();
+  assert.match(button.textContent, /1 запрос\/с/);
+
+  assert.deepEqual(rates, [3, 5, 1]);
+  assert.equal(values['animesssCardHelper.statsRate'], 1);
 });
 
 test('mass trade action requires confirmation and reports final counts', async () => {
@@ -875,8 +945,10 @@ test('mountUi creates a collapsed accessible panel with all card actions', () =>
       'Запустить проверку просветления',
       'Обновить спрос видимых карточек',
       'Переключить показ спроса карт',
+      'Переключить скорость запросов спроса',
       'Переключить авто-лут',
       'Переключить авто-кристалл',
+      'Переключить авто-взнос клуба',
       'Запустить массовый обмен',
       'Очистить кэш статистики',
     ],

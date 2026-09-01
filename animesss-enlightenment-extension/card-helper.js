@@ -211,6 +211,18 @@
     const inFlight = new Map();
     let requestTail = Promise.resolve();
     let hasRequested = false;
+    let requestRate = 3;
+    const requestDelays = new Map([
+      [1, 1000],
+      [3, 350],
+      [5, 200],
+    ]);
+
+    function setRequestRate(value) {
+      const normalized = Number(value);
+      if (requestDelays.has(normalized)) requestRate = normalized;
+      return requestRate;
+    }
 
     function endpoint(path, cardId) {
       const url = new URL(path, origin);
@@ -221,7 +233,7 @@
     function queuedFetch(url, shouldContinue) {
       const pending = requestTail.then(async () => {
         if (!shouldContinue()) throw new Error('Card stats request cancelled');
-        if (hasRequested) await sleep(350);
+        if (hasRequested) await sleep(requestDelays.get(requestRate));
         if (!shouldContinue()) throw new Error('Card stats request cancelled');
         hasRequested = true;
         return fetch(url);
@@ -328,7 +340,7 @@
       return pending;
     }
 
-    return { load };
+    return { load, setRequestRate, getRequestRate: () => requestRate };
   }
 
   function createInstanceMap(cards) {
@@ -419,37 +431,53 @@
   }
 
   function createAutoLootController({
-    fetch,
+    root,
     storage,
-    getUserHash,
-    now,
-    setInterval,
-    clearInterval,
-    notify,
+    Observer,
+    schedule,
   }) {
     const enabledKey = 'animesssCardHelper.autoLootEnabled';
-    const hourKey = 'animesssCardHelper.autoLootHour';
+    const handledNotifications = new WeakSet();
     let enabled = false;
-    let timer = null;
-    let inFlight = false;
+    let observer = null;
 
-    function startTimer() {
-      if (!enabled || timer !== null) return;
-      timer = setInterval(() => {
-        void runNow();
-      }, 190000);
+    function closeCardModal() {
+      const closeButton = root.querySelector(
+        '.ui-dialog[aria-describedby="card-modal"] .ui-dialog-titlebar-close, '
+        + '.modalfixed .ui-dialog-titlebar-close',
+      );
+      if (closeButton) closeButton.click();
     }
 
-    function stopTimer() {
-      if (timer === null) return;
-      clearInterval(timer);
-      timer = null;
+    function runNow() {
+      if (!enabled) return false;
+      const notification = root.querySelector('.card-notification');
+      if (!notification || handledNotifications.has(notification)) return false;
+      handledNotifications.add(notification);
+      notification.click();
+      schedule(closeCardModal);
+      return true;
+    }
+
+    function startObserver() {
+      if (!enabled || observer !== null) return;
+      observer = new Observer(() => {
+        runNow();
+      });
+      observer.observe(root, { childList: true, subtree: true });
+      runNow();
+    }
+
+    function stopObserver() {
+      if (observer === null) return;
+      observer.disconnect();
+      observer = null;
     }
 
     async function initialize() {
       const result = await storage.get(enabledKey);
       enabled = result && result[enabledKey] === true;
-      startTimer();
+      startObserver();
       return enabled;
     }
 
@@ -458,51 +486,195 @@
       if (enabled === next) return enabled;
       enabled = next;
       await storage.set({ [enabledKey]: enabled });
-      if (enabled) startTimer();
+      if (enabled) {
+        startObserver();
+      } else {
+        stopObserver();
+      }
+      return enabled;
+    }
+
+    function stop() {
+      enabled = false;
+      stopObserver();
+    }
+
+    return { initialize, setEnabled, runNow, stop };
+  }
+
+  function createClubBoostController({
+    root,
+    storage,
+    now = Date.now,
+    setTimeout,
+    clearTimeout,
+    sleep,
+    notify,
+    isBoostPage,
+  }) {
+    const enabledKey = 'animesssCardHelper.clubBoostEnabled';
+    const stateKey = 'animesssCardHelper.clubBoostDailyStateV2';
+    const moscowOffsetMs = 3 * 60 * 60 * 1000;
+    const maxDailyContributions = 20;
+    let enabled = false;
+    let timer = null;
+    let running = false;
+    let state = { date: '', count: 0 };
+
+    function moscowDateKey(value = now()) {
+      return new Date(value + moscowOffsetMs).toISOString().slice(0, 10);
+    }
+
+    function normalizeState(value) {
+      if (!value || typeof value !== 'object') {
+        return { date: moscowDateKey(), count: 0 };
+      }
+      const count = Number.parseInt(value.count, 10);
+      return {
+        date: /^\d{4}-\d{2}-\d{2}$/.test(String(value.date || ''))
+          ? value.date
+          : moscowDateKey(),
+        count: Number.isFinite(count)
+          ? Math.max(0, Math.min(maxDailyContributions, count))
+          : 0,
+      };
+    }
+
+    function resetForCurrentDate() {
+      const date = moscowDateKey();
+      if (state.date === date) return false;
+      state = { date, count: 0 };
+      return true;
+    }
+
+    async function persistState() {
+      await storage.set({ [stateKey]: state });
+    }
+
+    function moscowTarget(value, hour, minute = 0) {
+      const shifted = new Date(value + moscowOffsetMs);
+      return Date.UTC(
+        shifted.getUTCFullYear(),
+        shifted.getUTCMonth(),
+        shifted.getUTCDate(),
+        hour, minute, 0, 0,
+      ) - moscowOffsetMs;
+    }
+
+    function isContributionWindowOpen(value = now()) {
+      return value >= moscowTarget(value, 21) &&
+        value < moscowTarget(value, 22, 30);
+    }
+
+    function isClubClosed() {
+      const progress = root.querySelector(
+        '#my-progress .pbar__track[role="progressbar"]',
+      );
+      if (!progress) return false;
+      const current = Number.parseInt(progress.getAttribute('aria-valuenow'), 10);
+      const maximum = Number.parseInt(progress.getAttribute('aria-valuemax'), 10);
+      return Number.isFinite(current) &&
+        Number.isFinite(maximum) &&
+        maximum > 0 &&
+        current >= maximum;
+    }
+
+    function millisecondsUntilTarget() {
+      const current = now();
+      let target = moscowTarget(current, 21);
+      const end = moscowTarget(current, 22, 30);
+      const completedToday = state.date === moscowDateKey(current) &&
+        state.count >= maxDailyContributions;
+      if (completedToday || current >= end) {
+        target += 24 * 60 * 60 * 1000;
+      }
+      return Math.max(0, target - current);
+    }
+
+    function stopTimer() {
+      if (timer === null) return;
+      clearTimeout(timer);
+      timer = null;
+    }
+
+    function scheduleStart() {
+      if (
+        !enabled ||
+        !isBoostPage() ||
+        isClubClosed() ||
+        timer !== null
+      ) return;
+      const delay = millisecondsUntilTarget();
+      timer = setTimeout(() => {
+        timer = null;
+        void runNow();
+      }, delay);
+    }
+
+    async function initialize() {
+      const enabledResult = await storage.get(enabledKey);
+      const stateResult = await storage.get(stateKey);
+      enabled = enabledResult && enabledResult[enabledKey] === true;
+      state = normalizeState(stateResult && stateResult[stateKey]);
+      if (resetForCurrentDate()) await persistState();
+      scheduleStart();
+      return enabled;
+    }
+
+    async function setEnabled(value) {
+      enabled = value === true;
+      await storage.set({ [enabledKey]: enabled });
+      if (enabled) scheduleStart();
       else stopTimer();
       return enabled;
     }
 
     async function runNow() {
-      if (!enabled || inFlight) return false;
-      inFlight = true;
+      if (!enabled || !isBoostPage() || isClubClosed() || running) return false;
+      running = true;
+      stopTimer();
       try {
-        const hour = new Date(now()).toISOString().slice(0, 13);
-        const saved = await storage.get(hourKey);
-        if (saved && saved[hourKey] === hour) return false;
+        if (resetForCurrentDate()) await persistState();
+        const limit = maxDailyContributions;
 
-        const userHash = getUserHash();
-        if (!userHash) {
-          notify('error', 'Не удалось определить user_hash для авто-лута.');
-          return false;
-        }
-
-        const response = await fetch('/ajax/card_for_watch/', {
-          method: 'POST',
-          credentials: 'same-origin',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: new URLSearchParams({ user_hash: userHash }),
-        });
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        let text = await response.text();
-        if (text.startsWith('cards')) text = text.slice(5);
-        const data = JSON.parse(text);
-        if (
-          String(data.if_reward || '').toLowerCase() === 'yes' &&
-          Number.parseInt(data.reward_limit, 10) === 0
+        while (
+          enabled &&
+          state.count < limit &&
+          isContributionWindowOpen() &&
+          !isClubClosed()
         ) {
-          await storage.set({ [hourKey]: hour });
+          const refreshButton = root.querySelector(
+            '.button.button--primary.club__boost__refresh-btn',
+          );
+          if (refreshButton) refreshButton.click();
+          await sleep(300);
+          if (
+            !enabled ||
+            !isContributionWindowOpen() ||
+            isClubClosed()
+          ) break;
+
+          const contributeButton = root.querySelector(
+            '.button.button--primary.club__boost-btn',
+          );
+          if (contributeButton) {
+            contributeButton.click();
+            state.count += 1;
+            await persistState();
+          }
+          await sleep(800);
         }
-        return true;
-      } catch (error) {
-        if (isExtensionContextInvalidated(error)) {
-          stop();
-          return false;
+
+        if (state.count >= limit) {
+          notify('success', `Авто-взнос завершён: ${state.count}/${limit} карт.`);
         }
-        notify('error', 'Ошибка автоматического сбора карточки.');
+        return { contributed: state.count, limit };
+      } catch (_error) {
+        notify('error', 'Ошибка автоматического взноса карт в клуб.');
         return false;
       } finally {
-        inFlight = false;
+        running = false;
+        scheduleStart();
       }
     }
 
@@ -849,6 +1021,7 @@
     collectTradeCandidates,
     createAutoLootController,
     createChatCrystalController,
+    createClubBoostController,
     createCardObserver,
     createCardStatsCoordinator,
     createCardStatsClient,

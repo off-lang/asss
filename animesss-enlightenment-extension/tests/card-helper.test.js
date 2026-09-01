@@ -9,6 +9,7 @@ const {
   createCardStatsClient,
   createAutoLootController,
   createChatCrystalController,
+  createClubBoostController,
   createInstanceMap,
   createInstanceMapStore,
   createMassTradeController,
@@ -405,6 +406,30 @@ test('card stats client spaces network requests for about three per second', asy
   assert.deepEqual(events, ['fetch:17', 'sleep:350', 'fetch:18']);
 });
 
+test('card stats client applies 1, 3, and 5 request-per-second modes', async () => {
+  const waits = [];
+  const client = createCardStatsClient({
+    origin: 'https://animesss.com',
+    fetch: async () => httpResponse('MAIN'),
+    parseHtml: (body) => body,
+    parseStats: () => completeStats,
+    cache: valueCache(),
+    sleep: async (ms) => waits.push(ms),
+  });
+
+  assert.equal(typeof client.setRequestRate, 'function');
+  if (typeof client.setRequestRate !== 'function') return;
+  client.setRequestRate(1);
+  await client.load('17');
+  await client.load('18');
+  client.setRequestRate(3);
+  await client.load('19');
+  client.setRequestRate(5);
+  await client.load('20');
+
+  assert.deepEqual(waits, [1000, 350, 200]);
+});
+
 test('card stats client respects Retry-After after a 429 response', async () => {
   const waits = [];
   let calls = 0;
@@ -625,98 +650,477 @@ test('extractUserHash reads valid inline configuration and rejects unsafe values
   assert.equal(extractUserHash(inlineScriptDocument(['const other = 1;'])), '');
 });
 
-test('auto-loot stays disabled by default and starts only one timer when enabled', async () => {
+test('auto-loot clicks a card notification and closes its modal', async () => {
+  let cardClicks = 0;
+  let closeClicks = 0;
+  const scheduled = [];
+  const notification = { click: () => { cardClicks += 1; } };
+  const closeButton = { click: () => { closeClicks += 1; } };
+  const root = {
+    querySelector(selector) {
+      if (selector === '.card-notification') return notification;
+      if (selector.includes('.ui-dialog-titlebar-close')) return closeButton;
+      return null;
+    },
+  };
+  const observers = [];
+  class FakeObserver {
+    constructor(callback) {
+      this.callback = callback;
+      observers.push(this);
+    }
+    observe() {}
+    disconnect() {}
+  }
   const storage = memoryStorage();
-  const timers = [];
-  let fetches = 0;
   const controller = createAutoLootController({
-    fetch: async () => {
-      fetches += 1;
-      return httpResponse('{}');
-    },
+    root,
     storage,
-    getUserHash: () => 'abc_123',
-    now: () => Date.parse('2026-08-29T10:15:00Z'),
-    setInterval: (callback, delay) => {
-      timers.push([callback, delay]);
-      return timers.length;
-    },
-    clearInterval: () => {},
-    notify: () => {},
+    Observer: FakeObserver,
+    schedule: (callback) => scheduled.push(callback),
   });
 
   assert.equal(await controller.initialize(), false);
-  assert.equal(fetches, 0);
-  assert.equal(timers.length, 0);
+  assert.equal(cardClicks, 0);
+  assert.equal(observers.length, 0);
 
   await controller.setEnabled(true);
-  await controller.setEnabled(true);
-  assert.equal(timers.length, 1);
-  assert.equal(timers[0][1], 190000);
+  assert.equal(cardClicks, 1);
+  assert.equal(observers.length, 1);
   assert.equal(storage.values['animesssCardHelper.autoLootEnabled'], true);
+
+  scheduled.shift()();
+  assert.equal(closeClicks, 1);
 });
 
-test('auto-loot sends a same-origin encoded POST and observes the hourly limit', async () => {
-  const storage = memoryStorage();
-  const requests = [];
-  const notices = [];
-  const controller = createAutoLootController({
-    fetch: async (url, options) => {
-      requests.push([url, options]);
-      return httpResponse('cards{"if_reward":"yes","reward_limit":0}');
+test('auto-loot handles each dynamically added notification only once', async () => {
+  let currentNotification = null;
+  let observerCallback;
+  let disconnected = false;
+  const root = {
+    querySelector(selector) {
+      return selector === '.card-notification' ? currentNotification : null;
     },
-    storage,
-    getUserHash: () => 'abc_123',
-    now: () => Date.parse('2026-08-29T10:15:00Z'),
-    setInterval: () => 1,
-    clearInterval: () => {},
-    notify: (kind, message) => notices.push([kind, message]),
+  };
+  class FakeObserver {
+    constructor(callback) {
+      observerCallback = callback;
+    }
+    observe() {}
+    disconnect() { disconnected = true; }
+  }
+  const controller = createAutoLootController({
+    root,
+    storage: memoryStorage(),
+    Observer: FakeObserver,
+    schedule: () => {},
   });
   await controller.initialize();
   await controller.setEnabled(true);
 
-  assert.equal(await controller.runNow(), true);
-  assert.equal(requests.length, 1);
-  assert.equal(requests[0][0], '/ajax/card_for_watch/');
-  assert.equal(requests[0][1].method, 'POST');
-  assert.equal(requests[0][1].credentials, 'same-origin');
-  assert.equal(
-    requests[0][1].body.toString(),
-    'user_hash=abc_123',
-  );
-  assert.equal(
-    storage.values['animesssCardHelper.autoLootHour'],
-    '2026-08-29T10',
-  );
+  let firstClicks = 0;
+  currentNotification = { click: () => { firstClicks += 1; } };
+  observerCallback();
+  observerCallback();
+  assert.equal(firstClicks, 1);
 
-  assert.equal(await controller.runNow(), false);
-  assert.equal(requests.length, 1);
-  assert.equal(notices.some(([kind]) => kind === 'error'), false);
+  let secondClicks = 0;
+  currentNotification = { click: () => { secondClicks += 1; } };
+  observerCallback();
+  assert.equal(secondClicks, 1);
+
+  await controller.setEnabled(false);
+  assert.equal(disconnected, true);
 });
 
-test('auto-loot stops quietly when the extension context is invalidated', async () => {
-  let gets = 0;
-  const cleared = [];
-  const controller = createAutoLootController({
-    fetch: async () => httpResponse('{}'),
-    storage: {
-      async get(key) {
-        gets += 1;
-        if (gets === 1) return { [key]: true };
-        throw new Error('Extension context invalidated.');
-      },
-      async set() {},
+test('club boost waits until 21:00 Moscow when enabled before the target time', async () => {
+  const timers = [];
+  const controller = createClubBoostController({
+    root: { querySelector: () => null },
+    storage: memoryStorage({
+      'animesssCardHelper.clubBoostEnabled': true,
+    }),
+    now: () => Date.parse('2026-09-01T17:59:59Z'),
+    setTimeout: (callback, delay) => {
+      timers.push([callback, delay]);
+      return timers.length;
     },
-    getUserHash: () => 'abc_123',
-    now: () => Date.parse('2026-08-29T10:15:00Z'),
-    setInterval: () => 7,
-    clearInterval: (id) => cleared.push(id),
+    clearTimeout: () => {},
+    sleep: async () => {},
     notify: () => {},
+    isBoostPage: () => true,
+  });
+
+  assert.equal(await controller.initialize(), true);
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0][1], 1000);
+});
+
+test('club boost refreshes and contributes no more than 20 cards in total', async () => {
+  let refreshClicks = 0;
+  let contributeClicks = 0;
+  const delays = [];
+  const progress = {
+    getAttribute(name) {
+      if (name === 'aria-valuenow') return '0';
+      if (name === 'aria-valuemax') return '50';
+      return null;
+    },
+  };
+  const root = {
+    querySelector(selector) {
+      if (selector.includes('progressbar')) return progress;
+      if (selector.includes('club__boost__refresh-btn')) {
+        return { click: () => { refreshClicks += 1; } };
+      }
+      if (selector.includes('club__boost-btn')) {
+        return { click: () => { contributeClicks += 1; } };
+      }
+      return null;
+    },
+  };
+  const storage = memoryStorage({
+    'animesssCardHelper.clubBoostEnabled': true,
+  });
+  const controller = createClubBoostController({
+    root,
+    storage,
+    now: () => Date.parse('2026-09-01T18:00:00Z'),
+    setTimeout: () => 1,
+    clearTimeout: () => {},
+    sleep: async (delay) => { delays.push(delay); },
+    notify: () => {},
+    isBoostPage: () => true,
   });
   await controller.initialize();
 
-  await assert.doesNotReject(controller.runNow());
-  assert.deepEqual(cleared, [7]);
+  assert.deepEqual(await controller.runNow(), {
+    contributed: 20,
+    limit: 20,
+  });
+  assert.equal(refreshClicks, 20);
+  assert.equal(contributeClicks, 20);
+  assert.deepEqual(delays.slice(0, 2), [300, 800]);
+  assert.equal(delays.length, 40);
+  assert.deepEqual(
+    storage.values['animesssCardHelper.clubBoostDailyStateV2'],
+    { date: '2026-09-01', count: 20 },
+  );
+});
+
+test('club boost resumes the saved Moscow-day total after reload', async () => {
+  let refreshClicks = 0;
+  let contributeClicks = 0;
+  const root = {
+    querySelector(selector) {
+      if (selector.includes('progressbar')) {
+        return {
+          getAttribute: (name) => name === 'aria-valuemax' ? '20' : '0',
+        };
+      }
+      if (selector.includes('club__boost__refresh-btn')) {
+        return { click: () => { refreshClicks += 1; } };
+      }
+      if (selector.includes('club__boost-btn')) {
+        return { click: () => { contributeClicks += 1; } };
+      }
+      return null;
+    },
+  };
+  const storage = memoryStorage({
+    'animesssCardHelper.clubBoostEnabled': true,
+    'animesssCardHelper.clubBoostDailyStateV2': {
+      date: '2026-09-01',
+      count: 19,
+    },
+  });
+  const controller = createClubBoostController({
+    root,
+    storage,
+    now: () => Date.parse('2026-09-01T18:00:00Z'),
+    setTimeout: () => 1,
+    clearTimeout: () => {},
+    sleep: async () => {},
+    notify: () => {},
+    isBoostPage: () => true,
+  });
+  await controller.initialize();
+
+  assert.deepEqual(await controller.runNow(), {
+    contributed: 20,
+    limit: 20,
+  });
+  assert.equal(refreshClicks, 1);
+  assert.equal(contributeClicks, 1);
+});
+
+test('club boost ignores lifetime site progress when enforcing the daily limit', async () => {
+  let refreshClicks = 0;
+  let contributeClicks = 0;
+  const root = {
+    querySelector(selector) {
+      if (selector.includes('progressbar')) {
+        return {
+          getAttribute: (name) => name === 'aria-valuemax' ? '100' : '20',
+        };
+      }
+      if (selector.includes('club__boost__refresh-btn')) {
+        return { click: () => { refreshClicks += 1; } };
+      }
+      if (selector.includes('club__boost-btn')) {
+        return { click: () => { contributeClicks += 1; } };
+      }
+      return null;
+    },
+  };
+  const storage = memoryStorage({
+    'animesssCardHelper.clubBoostEnabled': true,
+    'animesssCardHelper.clubBoostDailyStateV2': {
+      date: '2026-09-01',
+      count: 0,
+    },
+  });
+  const controller = createClubBoostController({
+    root,
+    storage,
+    now: () => Date.parse('2026-09-01T18:00:00Z'),
+    setTimeout: () => 1,
+    clearTimeout: () => {},
+    sleep: async () => {},
+    notify: () => {},
+    isBoostPage: () => true,
+  });
+  await controller.initialize();
+
+  assert.deepEqual(await controller.runNow(), {
+    contributed: 20,
+    limit: 20,
+  });
+  assert.equal(refreshClicks, 20);
+  assert.equal(contributeClicks, 20);
+});
+
+test('club boost resets its own 20-card counter on a new Moscow date', async () => {
+  let contributeClicks = 0;
+  const root = {
+    querySelector(selector) {
+      if (selector.includes('club__boost__refresh-btn')) return { click() {} };
+      if (selector.includes('club__boost-btn')) {
+        return { click: () => { contributeClicks += 1; } };
+      }
+      return null;
+    },
+  };
+  const storage = memoryStorage({
+    'animesssCardHelper.clubBoostEnabled': true,
+    'animesssCardHelper.clubBoostDailyStateV2': {
+      date: '2026-08-31',
+      count: 20,
+    },
+  });
+  const controller = createClubBoostController({
+    root,
+    storage,
+    now: () => Date.parse('2026-09-01T18:00:00Z'),
+    setTimeout: () => 1,
+    clearTimeout: () => {},
+    sleep: async () => {},
+    notify: () => {},
+    isBoostPage: () => true,
+  });
+  await controller.initialize();
+  await controller.runNow();
+
+  assert.equal(contributeClicks, 20);
+  assert.deepEqual(
+    storage.values['animesssCardHelper.clubBoostDailyStateV2'],
+    { date: '2026-09-01', count: 20 },
+  );
+});
+
+test('club boost ignores the legacy counter populated from lifetime progress', async () => {
+  let contributeClicks = 0;
+  const root = {
+    querySelector(selector) {
+      if (selector.includes('club__boost__refresh-btn')) return { click() {} };
+      if (selector.includes('club__boost-btn')) {
+        return { click: () => { contributeClicks += 1; } };
+      }
+      return null;
+    },
+  };
+  const storage = memoryStorage({
+    'animesssCardHelper.clubBoostEnabled': true,
+    'animesssCardHelper.clubBoostState': {
+      date: '2026-09-01',
+      count: 20,
+    },
+  });
+  const controller = createClubBoostController({
+    root,
+    storage,
+    now: () => Date.parse('2026-09-01T18:00:00Z'),
+    setTimeout: () => 1,
+    clearTimeout: () => {},
+    sleep: async () => {},
+    notify: () => {},
+    isBoostPage: () => true,
+  });
+  await controller.initialize();
+  await controller.runNow();
+
+  assert.equal(contributeClicks, 20);
+});
+
+test('club boost schedules the next day when initialized after 22:30 Moscow', async () => {
+  const timers = [];
+  const controller = createClubBoostController({
+    root: { querySelector: () => null },
+    storage: memoryStorage({
+      'animesssCardHelper.clubBoostEnabled': true,
+    }),
+    now: () => Date.parse('2026-09-01T19:31:00Z'),
+    setTimeout: (callback, delay) => {
+      timers.push([callback, delay]);
+      return timers.length;
+    },
+    clearTimeout: () => {},
+    sleep: async () => {},
+    notify: () => {},
+    isBoostPage: () => true,
+  });
+
+  await controller.initialize();
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0][1], 80940000);
+});
+
+test('club boost stops before the next contribution when 22:30 Moscow arrives', async () => {
+  let currentTime = Date.parse('2026-09-01T19:29:59.900Z');
+  let refreshClicks = 0;
+  let contributeClicks = 0;
+  const root = {
+    querySelector(selector) {
+      if (selector.includes('club__boost__refresh-btn')) {
+        return { click: () => { refreshClicks += 1; } };
+      }
+      if (selector.includes('club__boost-btn')) {
+        return { click: () => { contributeClicks += 1; } };
+      }
+      return null;
+    },
+  };
+  const controller = createClubBoostController({
+    root,
+    storage: memoryStorage({
+      'animesssCardHelper.clubBoostEnabled': true,
+    }),
+    now: () => currentTime,
+    setTimeout: () => 1,
+    clearTimeout: () => {},
+    sleep: async (delay) => {
+      currentTime += delay;
+    },
+    notify: () => {},
+    isBoostPage: () => true,
+  });
+  await controller.initialize();
+
+  assert.deepEqual(await controller.runNow(), {
+    contributed: 0,
+    limit: 20,
+  });
+  assert.equal(refreshClicks, 1);
+  assert.equal(contributeClicks, 0);
+});
+
+test('club boost does not schedule or click when the club progress is closed', async () => {
+  const timers = [];
+  let clicks = 0;
+  const root = {
+    querySelector(selector) {
+      if (selector.includes('progressbar')) {
+        return {
+          getAttribute: (name) => name === 'aria-valuenow' ? '600' : '600',
+        };
+      }
+      return { click: () => { clicks += 1; } };
+    },
+  };
+  const controller = createClubBoostController({
+    root,
+    storage: memoryStorage({
+      'animesssCardHelper.clubBoostEnabled': true,
+    }),
+    now: () => Date.parse('2026-09-01T18:00:00Z'),
+    setTimeout: (callback, delay) => {
+      timers.push([callback, delay]);
+      return timers.length;
+    },
+    clearTimeout: () => {},
+    sleep: async () => {},
+    notify: () => {},
+    isBoostPage: () => true,
+  });
+
+  await controller.initialize();
+  assert.equal(timers.length, 0);
+  assert.equal(await controller.runNow(), false);
+  assert.equal(clicks, 0);
+});
+
+test('club boost stops its active loop as soon as progress reaches its maximum', async () => {
+  let currentProgress = 599;
+  let refreshClicks = 0;
+  let contributeClicks = 0;
+  let scheduledTimers = 0;
+  const root = {
+    querySelector(selector) {
+      if (selector.includes('progressbar')) {
+        return {
+          getAttribute: (name) => name === 'aria-valuenow'
+            ? String(currentProgress)
+            : '600',
+        };
+      }
+      if (selector.includes('club__boost__refresh-btn')) {
+        return { click: () => { refreshClicks += 1; } };
+      }
+      if (selector.includes('club__boost-btn')) {
+        return {
+          click: () => {
+            contributeClicks += 1;
+            currentProgress = 600;
+          },
+        };
+      }
+      return null;
+    },
+  };
+  const controller = createClubBoostController({
+    root,
+    storage: memoryStorage({
+      'animesssCardHelper.clubBoostEnabled': true,
+    }),
+    now: () => Date.parse('2026-09-01T18:00:00Z'),
+    setTimeout: () => {
+      scheduledTimers += 1;
+      return scheduledTimers;
+    },
+    clearTimeout: () => {},
+    sleep: async () => {},
+    notify: () => {},
+    isBoostPage: () => true,
+  });
+  await controller.initialize();
+
+  assert.deepEqual(await controller.runNow(), {
+    contributed: 1,
+    limit: 20,
+  });
+  assert.equal(refreshClicks, 1);
+  assert.equal(contributeClicks, 1);
+  assert.equal(scheduledTimers, 1);
 });
 
 const CRYSTAL_MESSAGE =
