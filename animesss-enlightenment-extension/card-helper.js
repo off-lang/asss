@@ -14,6 +14,45 @@
     '.card-pack__card',
   ];
   const CARD_SELECTOR = CARD_CLASSES.join(', ');
+  const NATIVE_STATS_SELECTOR = '.card-stats, .labyrinth-card-stats, .accshop-card-stats';
+  const HELPER_STATS_SELECTOR = '.animesss-enlightenment-card-stats';
+
+  function cardStatsWrapper(card) {
+    if(hasClass(card,'accshop__buy-btn'))return card.closest?.('.accshop__card') || card.closest?.('#accshopCardsWrap > *') || card.parentElement || card;
+    return card.closest?.('.anime-cards__item-wrapper') || card;
+  }
+
+  function hasNativeCardStats(card) {
+    const wrapper=cardStatsWrapper(card);
+    function visible(el) {
+      for(let node=el;node;node=node.parentElement) {
+        if(node.hidden || node.getAttribute?.('aria-hidden')==='true')return false;
+        const style=node.ownerDocument?.defaultView?.getComputedStyle(node);
+        if(style && (style.display==='none' || style.visibility==='hidden' || style.visibility==='collapse'))return false;
+        if(node===wrapper)break;
+      }
+      return true;
+    }
+    return [...(wrapper.querySelectorAll?.(NATIVE_STATS_SELECTOR) || [])].some(block=>{
+      if(block.closest?.(HELPER_STATS_SELECTOR) || !visible(block))return false;
+      // A paid feature can be absent, hidden, or still loading. Require real counters,
+      // including zero; do not treat a placeholder or a global subscription flag as data.
+      return ['Владельцев','Хотят получить','Готовы обменять'].every(label=>
+        [...block.querySelectorAll('[title], [aria-label]')].some(metric=>{
+          if(!visible(metric))return false;
+          const caption=metric.getAttribute('aria-label') || metric.getAttribute('title') || '';
+          if(caption!==label && !caption.startsWith(label+':'))return false;
+          const value=caption.includes(':')?caption.slice(caption.indexOf(':')+1):metric.textContent;
+          return /^\d+$/.test(value.replace(/[\s\u00a0\u202f]/g,''));
+        }));
+    });
+  }
+
+  function suppressNativeDuplicate(card) {
+    if(!hasNativeCardStats(card))return false;
+    for(const block of cardStatsWrapper(card).querySelectorAll?.(HELPER_STATS_SELECTOR) || [])block.remove();
+    return true;
+  }
 
   function numericId(value) {
     const normalized = String(value || '').trim();
@@ -44,7 +83,8 @@
       return numericId(lookupInstance(instanceId));
     }
 
-    for (const attribute of ['data-card-id', 'card-id', 'data-id']) {
+    const isTrade = hasClass(element,'trade__inventory-item') || hasClass(element,'trade__main-item');
+    for (const attribute of (isTrade ? ['data-original-id','data-card-id','card-id'] : ['data-card-id', 'card-id', 'data-id'])) {
       const id = numericId(element.getAttribute(attribute));
       if (id) return id;
     }
@@ -61,7 +101,7 @@
         return idFromHref(link.getAttribute('href'));
       }
     }
-    return null;
+    return isTrade ? numericId(lookupInstance(element.getAttribute('data-id'))) : null;
   }
 
   function normalizeText(value) {
@@ -137,21 +177,30 @@
 
   function parseCardStats(doc, origin) {
     const owners = parseUsers(doc, origin);
-    const calculatedDuplicates = owners.reduce(
-      (sum, user) => sum + Math.max(0, user.copies - 1),
-      0,
-    );
     return {
-      ownersCount: parseCounter(doc, '#owners-count', owners.length),
-      needCount: parseCounter(doc, '#owners-need', 0),
-      tradeCount: parseCounter(doc, '#owners-trade', 0),
+      ownersCount: parseCounter(doc, '#owners-count', owners.length || null),
+      needCount: parseCounter(doc, '#owners-need', null),
+      tradeCount: parseCounter(doc, '#owners-trade', null),
       duplicates: parseCounter(
         doc,
         '[title="Дубли на руках"]',
-        calculatedDuplicates,
+        null,
       ),
       users: { owners, need: [], trade: [] },
     };
+  }
+
+  function parsePersonalCopies(doc, origin, name) {
+    const heading = doc.querySelector('h1.ncard__main-title');
+    const profile = heading?.querySelector('a[href]');
+    if (!profile) return null;
+    try {
+      const url = new URL(profile.getAttribute('href'), origin);
+      if (url.origin !== origin || decodeURIComponent(url.pathname) !== `/user/${name}/`) return null;
+    } catch (_) { return null; }
+    const match = normalizeText(heading.querySelector('span')?.textContent).match(/^\(([\d\s]+) шт\.\)$/);
+    const total = match ? Number(match[1].replace(/\s/g, '')) : NaN;
+    return Number.isSafeInteger(total) && total >= 0 ? total : null;
   }
 
   function createTtlCache({ storage, now = Date.now, prefix, ttlMs }) {
@@ -207,6 +256,9 @@
     parseStats = parseCardStats,
     cache,
     sleep,
+    collectionName = '',
+    collectionRank = '',
+    instanceStore,
   }) {
     const inFlight = new Map();
     let requestTail = Promise.resolve();
@@ -275,27 +327,23 @@
       throw lastError;
     }
 
-    async function fetchStats(cardId, shouldContinue) {
+    async function fetchStats(cardId, shouldContinue, onProgress) {
       const mainDoc = await requestDocument(
         endpoint('/cards/users/', cardId),
         shouldContinue,
       );
       const stats = parseStats(mainDoc, origin);
-      for (const [kind, path] of [
-        ['need', '/cards/users/need/'],
-        ['trade', '/cards/users/trade/'],
-      ]) {
-        if (!shouldContinue()) throw new Error('Card stats request cancelled');
-        if (stats.users[kind].length > 0) continue;
+      if ([stats.ownersCount,stats.needCount,stats.tradeCount].every(value=>value==null)) throw new Error('Статистика карты отсутствует');
+      // The site's "Дубли на руках" is this visitor's total copies, not
+      // duplicate holdings summed across a (possibly paginated) owners list.
+      if (stats.duplicates == null && collectionName) {
+        if (shouldContinue()) onProgress({ status: 'ready', ...stats });
+        const url = new URL('/user/cards/', origin);
+        url.searchParams.set('name', collectionName);
+        url.searchParams.set('card_id', cardId);
         try {
-          const listDoc = await requestDocument(
-            endpoint(path, cardId),
-            shouldContinue,
-          );
-          stats.users[kind] = parseStats(listDoc, origin).users.owners;
-        } catch (_error) {
-          stats.users[kind] = [];
-        }
+          stats.duplicates = parsePersonalCopies(await requestDocument(url.href, shouldContinue), origin, collectionName);
+        } catch (_) { stats.duplicates = null; }
       }
       await cache.set(cardId, stats);
       return { status: 'ready', ...stats };
@@ -305,6 +353,7 @@
       cardId,
       { force = false } = {},
       shouldContinue = () => true,
+      onProgress = () => {},
     ) {
       const normalizedId = numericId(cardId);
       if (!normalizedId) {
@@ -324,7 +373,7 @@
       }
       if (inFlight.has(normalizedId)) return inFlight.get(normalizedId);
 
-      const pending = fetchStats(normalizedId, shouldContinue)
+      const pending = fetchStats(normalizedId, shouldContinue, onProgress)
         .catch(() => ({
           status: 'error',
           ownersCount: null,
@@ -340,15 +389,57 @@
       return pending;
     }
 
-    return { load, setRequestRate, getRequestRate: () => requestRate };
+    const collectionScans = new Map();
+    const resolvedInstances = new Map();
+    async function resolveInstance(instanceId, shouldContinue = () => true, rank = collectionRank) {
+      const id = numericId(instanceId);
+      if (!id || !collectionName || !/^[a-z_]+$/.test(rank)) return null;
+      const lookup = () => instanceStore?.lookup(id) || resolvedInstances.get(id) || null;
+      if (lookup()) return lookup();
+      // Own-instance trade pages reject self-trades. Read the collection instead,
+      // preserving all mappings from each page and sharing one scan per rank.
+      if (!collectionScans.has(rank)) collectionScans.set(rank, { page: 1, done: false, pending: null });
+      const state = collectionScans.get(rank);
+      while (shouldContinue() && !lookup() && !state.done) {
+        if (!state.pending) {
+          state.pending = (async () => {
+            const url = new URL('/user/cards/', origin);
+            url.searchParams.set('name', collectionName);
+            url.searchParams.set('rank', rank);
+            url.searchParams.set('page', String(state.page));
+            const doc = await requestDocument(url.href, shouldContinue);
+            if (!shouldContinue()) return;
+            const cards = [...doc.querySelectorAll('.anime-cards__item[data-owner-id][data-id]')];
+            if (!cards.length) throw new Error('Не удалось прочитать коллекцию карт');
+            for (const [instance, canonical] of createInstanceMap(cards)) resolvedInstances.set(instance, canonical);
+            await instanceStore?.remember(cards);
+            const hasNext = [...doc.querySelectorAll('a[href]')].some(link => {
+              try {
+                const next = new URL(link.getAttribute('href'), origin);
+                return next.origin === origin && next.pathname === '/user/cards/' &&
+                  next.searchParams.get('name') === collectionName &&
+                  next.searchParams.get('rank') === rank &&
+                  Number(next.searchParams.get('page')) === state.page + 1;
+              } catch { return false; }
+            });
+            state.done = !hasNext || state.page >= 200;
+            state.page += 1;
+          })().finally(() => { state.pending = null; });
+        }
+        await state.pending;
+      }
+      return lookup();
+    }
+    return { load, resolveInstance, setRequestRate, getRequestRate: () => requestRate };
   }
 
   function createInstanceMap(cards) {
     const map = new Map();
     for (const card of cards || []) {
       if (!card || typeof card.getAttribute !== 'function') continue;
-      const instanceId = String(card.getAttribute('data-owner-id') || '').trim();
-      const canonicalId = numericId(card.getAttribute('data-id'));
+      const trade = hasClass(card, 'trade__inventory-item') || hasClass(card, 'trade__main-item');
+      const instanceId = String(card.getAttribute(trade ? 'data-id' : 'data-owner-id') || '').trim();
+      const canonicalId = trade ? getCanonicalCardId(card) : numericId(card.getAttribute('data-id'));
       if (instanceId && canonicalId) map.set(instanceId, canonicalId);
     }
     return map;
@@ -381,27 +472,83 @@
       initialize,
       remember,
       lookup: (instanceId) => values.get(instanceId) || null,
+      async rememberPair(instanceId, canonicalId) {
+        if (!numericId(instanceId) || !numericId(canonicalId)) return;
+        values.set(String(instanceId),String(canonicalId));
+        await storage.set({[key]:Object.fromEntries(values)});
+      },
     };
   }
 
   function createCardStatsCoordinator({ client, instanceStore, render }) {
     let enabled = true;
     let generation = 0;
+    const retained = new Map();
+    function identity(card) {
+      const keys=[];
+      const id=getCanonicalCardId(card,instanceStore.lookup);
+      if(id)keys.push('card:'+id);
+      const trade=hasClass(card,'trade__inventory-item')||hasClass(card,'trade__main-item');
+      const instance=card.getAttribute(trade?'data-id':'data-owner-id');
+      if(instance)keys.push('instance:'+instance);
+      const image=card.querySelector?.('img[src], img[data-src]');
+      const src=image?.getAttribute('data-src')||image?.getAttribute('src');
+      if(src && /\/cards_image\//.test(src)) {
+        try {keys.push('image:'+new URL(src,'https://animesss.com').pathname);}catch{}
+      }
+      return keys;
+    }
+    function previous(keys) {for(const key of keys)if(retained.has(key))return retained.get(key);return null;}
+    function remember(keys,entry) {
+      for(const key of keys)retained.set(key,entry);
+      while(retained.size>3000)retained.delete(retained.keys().next().value);
+    }
 
     async function process(cards, { force = false } = {}) {
       if (!enabled) return;
       const currentGeneration = generation;
       const uniqueCards = [...new Set(cards || [])];
+      // Restore every known card before waiting for any network request.
+      const restored=new Set();
+      for(const card of uniqueCards){
+        if(suppressNativeDuplicate(card))continue;
+        const keys=identity(card),saved=previous(keys);
+        if(saved){render(card,saved.result);remember(keys,saved);restored.add(card);}
+      }
       await instanceStore.remember(uniqueCards);
       for (const card of uniqueCards) {
+        if(suppressNativeDuplicate(card))continue;
         const shouldContinue = () =>
-          enabled && generation === currentGeneration;
-        if (!shouldContinue()) break;
-        const cardId = getCanonicalCardId(card, instanceStore.lookup);
-        if (!cardId) continue;
-        const result = await client.load(cardId, { force }, shouldContinue);
-        if (!shouldContinue()) break;
-        render(card, result);
+          enabled && generation === currentGeneration && card.isConnected !== false && !hasNativeCardStats(card);
+        if (!shouldContinue()) continue;
+        if(!force && restored.has(card))continue;
+        const keys=identity(card), snapshot=JSON.stringify(keys);
+        const saved=previous(keys);
+        if(saved && !force){render(card,saved.result);continue;}
+        let cardId = getCanonicalCardId(card, instanceStore.lookup);
+        if(!cardId && saved)cardId=saved.cardId;
+        if (!cardId && (hasClass(card,'trade__inventory-item') || hasClass(card,'trade__main-item')) && client.resolveInstance) {
+          try {
+            cardId = await client.resolveInstance(card.getAttribute('data-id'),shouldContinue,card.getAttribute('data-rank') || undefined);
+            if(cardId && shouldContinue()) await instanceStore.rememberPair(card.getAttribute('data-id'),cardId);
+          } catch (_) { cardId=null; }
+        }
+        if (!shouldContinue()) {suppressNativeDuplicate(card);continue;}
+        if (!cardId) {
+          if(previous(keys))continue;
+          render(card,{status:'error',ownersCount:null,needCount:null,tradeCount:null,duplicates:null,users:{owners:[],need:[],trade:[]}});
+          continue;
+        }
+        const result = await client.load(cardId, { force }, shouldContinue, partial => {
+          if (!shouldContinue()) return;
+          if (JSON.stringify(identity(card)) !== snapshot) return;
+          render(card, {...partial, duplicates: partial.duplicates ?? previous(keys)?.result.duplicates ?? null});
+        });
+        if (!shouldContinue()) {suppressNativeDuplicate(card);continue;}
+        if(result.status==='ready')remember([...keys,'card:'+cardId],{cardId,result});
+        // The site may reuse a DOM element for a different card while a request runs.
+        if(JSON.stringify(identity(card))!==snapshot && !keys.some(k=>identity(card).includes(k)))continue;
+        render(card,result.status==='ready'?result:(previous(keys)?.result || result));
       }
     }
 
@@ -413,7 +560,7 @@
       return enabled;
     }
 
-    return { process, setEnabled, isEnabled: () => enabled };
+    return { process, setEnabled, clearRetained:()=>retained.clear(), isEnabled: () => enabled };
   }
 
   function extractUserHash(doc) {
@@ -502,6 +649,33 @@
     return { initialize, setEnabled, runNow, stop };
   }
 
+  function createClubBoostJournal({ storage, now = Date.now, log = console }) {
+    const key = 'animesssCardHelper.clubBoostJournalV1';
+    let pending = Promise.resolve();
+    function enqueue(action) {
+      pending = pending.then(action).catch((error) => {
+        log.error('Не удалось сохранить журнал авто-взноса:', error);
+      });
+      return pending;
+    }
+    async function read() {
+      const result = await storage.get(key);
+      return Array.isArray(result?.[key]) ? result[key] : [];
+    }
+    function record(event, details = {}) {
+      const entry = { time: new Date(now()).toISOString(), event, ...details };
+      return enqueue(async () => {
+        const entries = await read();
+        await storage.set({ [key]: [...entries, entry].slice(-500) });
+      });
+    }
+    return {
+      record,
+      async getEntries() { await pending; return read(); },
+      clear: () => enqueue(() => storage.set({ [key]: [] })),
+    };
+  }
+
   function createClubBoostController({
     root,
     storage,
@@ -509,46 +683,58 @@
     setTimeout,
     clearTimeout,
     sleep,
+    pressContributeKey = () => {},
     notify,
     isBoostPage,
+    journal = { record() {} },
+    reloadPage,
+    reloadStorage = storage,
+    refreshTask = () => false,
   }) {
     const enabledKey = 'animesssCardHelper.clubBoostEnabled';
-    const stateKey = 'animesssCardHelper.clubBoostDailyStateV2';
     const moscowOffsetMs = 3 * 60 * 60 * 1000;
-    const maxDailyContributions = 20;
+    const keyIntervalMs = 500;
+    const completedKey = 'animesssCardHelper.clubBoostCompletedDate';
+    let completedDate = '';
+    let settingsRevision = 0;
+    let initialized = false;
+    let awaitingFreshProgress = false;
     let enabled = false;
     let timer = null;
     let running = false;
-    let state = { date: '', count: 0 };
+    let preparing = false;
+    let reloadRequested = false;
+    const reloadKey = 'animesssCardHelper.clubBoostReloadDate';
 
-    function moscowDateKey(value = now()) {
-      return new Date(value + moscowOffsetMs).toISOString().slice(0, 10);
+    function moscowDate() {
+      return new Date(now() + moscowOffsetMs).toISOString().slice(0, 10);
     }
 
-    function normalizeState(value) {
-      if (!value || typeof value !== 'object') {
-        return { date: moscowDateKey(), count: 0 };
+    async function startScheduledRun() {
+      if (!enabled || !isBoostPage() || running || preparing || reloadRequested) return;
+      preparing = true;
+      try {
+        if (!isContributionWindowOpen()) { scheduleStart(); return; }
+        if (reloadPage) {
+          const saved = await reloadStorage.get(reloadKey);
+          if (!enabled || !isContributionWindowOpen()) return;
+          if (saved?.[reloadKey] !== moscowDate()) {
+            await reloadStorage.set({ [reloadKey]: moscowDate() });
+            await journal.record('Перезагрузка страницы перед авто-взносом', { date: moscowDate() });
+            if (!enabled || !isContributionWindowOpen()) return;
+            reloadRequested = true;
+            reloadPage();
+            return;
+          }
+          await journal.record('Страница обновлена сегодня; переход к авто-взносу');
+        }
+        await runNow();
+      } catch (error) {
+        await journal.record('Ошибка подготовки авто-взноса', { message: String(error?.message || error).slice(0, 500) });
+        notify('error', 'Не удалось подготовить авто-взнос. Проверьте журнал.');
+      } finally {
+        preparing = false;
       }
-      const count = Number.parseInt(value.count, 10);
-      return {
-        date: /^\d{4}-\d{2}-\d{2}$/.test(String(value.date || ''))
-          ? value.date
-          : moscowDateKey(),
-        count: Number.isFinite(count)
-          ? Math.max(0, Math.min(maxDailyContributions, count))
-          : 0,
-      };
-    }
-
-    function resetForCurrentDate() {
-      const date = moscowDateKey();
-      if (state.date === date) return false;
-      state = { date, count: 0 };
-      return true;
-    }
-
-    async function persistState() {
-      await storage.set({ [stateKey]: state });
     }
 
     function moscowTarget(value, hour, minute = 0) {
@@ -562,7 +748,7 @@
     }
 
     function isContributionWindowOpen(value = now()) {
-      return value >= moscowTarget(value, 21) &&
+      return value >= moscowTarget(value, 21, 1) &&
         value < moscowTarget(value, 22, 30);
     }
 
@@ -579,13 +765,44 @@
         current >= maximum;
     }
 
+    function getBoostDiagnostics() {
+      const progress = root.querySelector('#my-progress .pbar__track[role="progressbar"]');
+      const refresh = root.querySelector('.club__boost__refresh-btn');
+      const donate = root.querySelector('.club__boost-btn');
+      return {
+        progressCurrent: progress?.getAttribute('aria-valuenow') ?? null,
+        progressMaximum: progress?.getAttribute('aria-valuemax') ?? null,
+        refreshButtonPresent: Boolean(refresh),
+        donateButtonPresent: Boolean(donate),
+        refreshDisabled: Boolean(refresh?.disabled),
+        donateDisabled: Boolean(donate?.disabled),
+        cardId: getCurrentCardId(),
+      };
+    }
+
+    function getCurrentCardId() {
+      const cardControl = root.querySelector(
+        '.club__boost-btn[data-card-id], ' +
+        '.club__boost__refresh-btn[data-card-id]',
+      );
+      if (!cardControl) return '';
+      const attribute = typeof cardControl.getAttribute === 'function'
+        ? cardControl.getAttribute('data-card-id')
+        : null;
+      return String(attribute || cardControl.dataset?.cardId || '').trim();
+    }
+
+    async function waitForCardChange(previousCardId) {
+      await sleep(keyIntervalMs);
+      const currentCardId = getCurrentCardId();
+      return Boolean(currentCardId && currentCardId !== previousCardId);
+    }
+
     function millisecondsUntilTarget() {
       const current = now();
-      let target = moscowTarget(current, 21);
+      let target = moscowTarget(current, 21, 1);
       const end = moscowTarget(current, 22, 30);
-      const completedToday = state.date === moscowDateKey(current) &&
-        state.count >= maxDailyContributions;
-      if (completedToday || current >= end) {
+      if (current >= end || completedDate === moscowDate()) {
         target += 24 * 60 * 60 * 1000;
       }
       return Math.max(0, target - current);
@@ -601,22 +818,30 @@
       if (
         !enabled ||
         !isBoostPage() ||
-        isClubClosed() ||
+        reloadRequested ||
         timer !== null
       ) return;
-      const delay = millisecondsUntilTarget();
+      let delay = millisecondsUntilTarget();
+      // An initially full page is unverified. Background checks, not a zero-delay
+      // local retry loop, will refresh it at 21:02, 21:03 and 21:05.
+      if (awaitingFreshProgress && delay === 0) delay = moscowTarget(now(),21,1)+86400000-now();
+      journal.record('Запуск запланирован', { startAt: new Date(now() + delay).toISOString() });
       timer = setTimeout(() => {
         timer = null;
-        void runNow();
+        return startScheduledRun();
       }, delay);
     }
 
     async function initialize() {
+      const revision = settingsRevision;
       const enabledResult = await storage.get(enabledKey);
-      const stateResult = await storage.get(stateKey);
-      enabled = enabledResult && enabledResult[enabledKey] === true;
-      state = normalizeState(stateResult && stateResult[stateKey]);
-      if (resetForCurrentDate()) await persistState();
+      completedDate = (await storage.get(completedKey))?.[completedKey] || '';
+      if (revision === settingsRevision) enabled = enabledResult && enabledResult[enabledKey] === true;
+      initialized = true;
+      if (isBoostPage()) journal.record('Скрипт загружен на странице клуба', {
+        enabled, closed: isClubClosed(), cardId: getCurrentCardId(),
+        ...getBoostDiagnostics(),
+      });
       scheduleStart();
       return enabled;
     }
@@ -624,66 +849,138 @@
     async function setEnabled(value) {
       enabled = value === true;
       await storage.set({ [enabledKey]: enabled });
+      journal.record(enabled ? 'Авто-взнос включён' : 'Авто-взнос выключен', {
+        boostPage: isBoostPage(), closed: isClubClosed(),
+      });
       if (enabled) scheduleStart();
       else stopTimer();
       return enabled;
     }
 
+    function syncEnabled(value) {
+      settingsRevision += 1;
+      const next = value === true;
+      if (enabled === next) return enabled;
+      enabled = next;
+      journal.record('Настройка авто-взноса синхронизирована', {enabled, boostPage:isBoostPage()});
+      if (!enabled) stopTimer();
+      else if (initialized && !running && !preparing) scheduleStart();
+      return enabled;
+    }
+
     async function runNow() {
-      if (!enabled || !isBoostPage() || isClubClosed() || running) return false;
+      if (enabled && isBoostPage() && isContributionWindowOpen() && isClubClosed() && !running && completedDate !== moscowDate()) {
+        awaitingFreshProgress = true;
+        journal.record('600/600 при загрузке: завершение дня не подтверждено; ожидается повторная проверка',getBoostDiagnostics());
+      }
+      if (!enabled || !isBoostPage() || isClubClosed() || running || completedDate === moscowDate()) {
+        journal.record('Запуск пропущен', {
+          enabled, boostPage: isBoostPage(), closed: isClubClosed(), running,
+          ...getBoostDiagnostics(),
+        });
+        if (enabled && isBoostPage() && isClubClosed() && !running) scheduleStart();
+        return false;
+      }
       running = true;
+      awaitingFreshProgress = false;
       stopTimer();
+      let attempts = 0;
+      let contributed = 0;
+      let failed = false;
+      journal.record('Цикл авто-взноса начат', { cardId: getCurrentCardId() });
       try {
-        if (resetForCurrentDate()) await persistState();
-        const limit = maxDailyContributions;
 
         while (
           enabled &&
-          state.count < limit &&
           isContributionWindowOpen() &&
           !isClubClosed()
         ) {
-          const refreshButton = root.querySelector(
-            '.button.button--primary.club__boost__refresh-btn',
-          );
-          if (refreshButton) refreshButton.click();
-          await sleep(300);
-          if (
-            !enabled ||
-            !isContributionWindowOpen() ||
-            isClubClosed()
-          ) break;
-
-          const contributeButton = root.querySelector(
-            '.button.button--primary.club__boost-btn',
-          );
-          if (contributeButton) {
-            contributeButton.click();
-            state.count += 1;
-            await persistState();
+          const previousCardId = getCurrentCardId();
+          attempts += 1;
+          journal.record('Попытка авто-взноса', { attempt: attempts, cardId: previousCardId || 'не найден' });
+          const action = pressContributeKey();
+          journal.record('Действие авто-взноса; следующая проверка через 0,5 секунды', {
+            attempt: attempts, action: action || 'S', ...getBoostDiagnostics(),
+          });
+          if (await waitForCardChange(previousCardId)) {
+            contributed += 1;
+            journal.record('Карта сменилась (сам взнос сервером не подтверждён)', {
+              previousCardId, cardId: getCurrentCardId(), observedChanges: contributed,
+            });
+            continue;
           }
-          await sleep(800);
+          if (
+            enabled &&
+            isContributionWindowOpen() &&
+            !isClubClosed()
+          ) {
+            journal.record('Карта не сменилась; повторная попытка', {cardId: getCurrentCardId()});
+          }
         }
-
-        if (state.count >= limit) {
-          notify('success', `Авто-взнос завершён: ${state.count}/${limit} карт.`);
-        }
-        return { contributed: state.count, limit };
-      } catch (_error) {
+        return { contributed };
+      } catch (error) {
+        failed = true;
+        enabled = false; // A broken extension connection must not cause a retry storm.
+        journal.record('Ошибка авто-взноса', { message: String(error?.message || error).slice(0, 500) });
         notify('error', 'Ошибка автоматического взноса карт в клуб.');
         return false;
       } finally {
+        journal.record('Цикл остановлен', {
+          reason: failed ? 'ошибка' : !enabled ? 'выключен вручную' : isClubClosed() ? 'клуб заполнен' : 'время работы закончилось',
+          attempts, observedChanges: contributed,
+        });
         running = false;
+        if (isClubClosed() && isContributionWindowOpen()) await markCompleted();
         scheduleStart();
       }
+    }
+
+    async function markCompleted() {
+      if (completedDate === moscowDate()) return;
+      completedDate = moscowDate();
+      stopTimer();
+      try { await storage.set({[completedKey]: completedDate}); }
+      catch (error) { journal.record('Не удалось сохранить завершение дня', {message:String(error)}); }
+      journal.record('Клуб заполнен; авто-взнос завершён до следующего дня', getBoostDiagnostics());
     }
 
     function stop() {
       enabled = false;
       stopTimer();
+      journal.record('Авто-взнос остановлен');
     }
 
-    return { initialize, setEnabled, runNow, stop };
+    async function checkScheduledRun(minute = 5) {
+      if (![2,3,5].includes(minute)) return;
+      if (!initialized || !isBoostPage()) return;
+      const saved = await storage.get(enabledKey);
+      completedDate = (await storage.get(completedKey))?.[completedKey] || '';
+      syncEnabled(saved?.[enabledKey] === true);
+      const eligible = enabled && !running && !preparing && !reloadRequested &&
+        completedDate !== moscowDate() && isContributionWindowOpen() &&
+        now() >= moscowTarget(now(),21,minute);
+      journal.record(`Контрольная проверка авто-взноса 21:0${minute}`, {
+        enabled, running, preparing, completedToday:completedDate===moscowDate(), retry:eligible,
+      });
+      if (!eligible) return;
+      stopTimer();
+      if (isClubClosed() && reloadPage) {
+        const checkKey = 'animesssCardHelper.clubBoostRecheck:' + minute;
+        const previous = await reloadStorage.get(checkKey);
+        if (!enabled || running || preparing || !isContributionWindowOpen()) return;
+        if (previous?.[checkKey] !== moscowDate()) {
+          await reloadStorage.set({[checkKey]:moscowDate()});
+          await journal.record('Повторная перезагрузка для проверки 600/600', {minute});
+          if (!enabled || running || !isContributionWindowOpen()) return;
+          reloadRequested = true;
+          reloadPage();
+          return;
+        }
+      }
+      await startScheduledRun();
+    }
+
+    return { initialize, setEnabled, syncEnabled, checkScheduledRun, runNow, stop };
   }
 
   function createChatCrystalController({
@@ -691,6 +988,8 @@
     storage,
     setInterval,
     clearInterval,
+    sleep = async () => {},
+    log = console,
   }) {
     const targetMessage = normalizeText(
       'Шпион демонической секты отобрал 300 мешков с камнями духа, помогите их собрать',
@@ -777,7 +1076,15 @@
       inFlight = true;
       try {
         const returnButton = findReturnButton();
-        if (returnButton) returnButton.click();
+        if (returnButton) {
+          returnButton.click();
+          // Resuming the site's chat starts an asynchronous loadNew request.
+          for (let attempt = 0; attempt < 10 && enabled; attempt += 1) {
+            await sleep(1000);
+            if (!enabled) return false;
+            await scan();
+          }
+        }
         await scan();
         return true;
       } catch (error) {
@@ -785,7 +1092,8 @@
           stop();
           return false;
         }
-        throw error;
+        log.error('Ошибка проверки авто-кристалла:', error);
+        return false;
       } finally {
         inFlight = false;
       }
@@ -987,25 +1295,42 @@
     }
 
     const observer = new Observer((mutations) => {
+      function element(node){return node?.nodeType===1?node:node?.parentElement;}
+      function own(node){return Boolean(element(node)?.closest?.(HELPER_STATS_SELECTOR));}
+      function native(node){const el=element(node);return Boolean(el?.closest?.(NATIVE_STATS_SELECTOR)||el?.querySelector?.(NATIVE_STATS_SELECTOR));}
+      function queueOwner(node){
+        const el=element(node);if(!el)return;
+        queue(el.closest?.(selector));
+        const wrapper=el.closest?.('.accshop__card, .anime-cards__item-wrapper');
+        if(wrapper)collect(wrapper);
+      }
       for (const mutation of mutations) {
+        if(own(mutation.target))continue;
         if (mutation.type === 'childList') {
           for (const node of mutation.addedNodes || []) collect(node);
+          if(element(mutation.target)?.closest?.(NATIVE_STATS_SELECTOR) ||
+            [...(mutation.addedNodes||[]),...(mutation.removedNodes||[])].some(node=>!own(node)&&native(node)))queueOwner(mutation.target);
+        } else if(mutation.type==='characterData' && native(mutation.target)) {
+          queueOwner(mutation.target);
         } else if (
           mutation.type === 'attributes' &&
-          mutation.attributeName === 'data-id' &&
+          ['data-id', 'data-card-id', 'card-id', 'data-original-id', 'data-owner-id', 'data-rank'].includes(mutation.attributeName) &&
           mutation.target &&
           typeof mutation.target.matches === 'function' &&
           mutation.target.matches(selector)
         ) {
           queue(mutation.target);
+        } else if(mutation.type==='attributes' && native(mutation.target)) {
+          queueOwner(mutation.target);collect(mutation.target);
         }
       }
     });
     observer.observe(root, {
       childList: true,
       subtree: true,
+      characterData: true,
       attributes: true,
-      attributeFilter: ['data-id', 'data-card-id', 'card-id'],
+      attributeFilter: ['data-id', 'data-card-id', 'card-id', 'data-original-id', 'data-owner-id', 'data-rank', 'class', 'style', 'hidden', 'aria-hidden', 'title', 'aria-label'],
     });
 
     function scan() {
@@ -1017,11 +1342,14 @@
   }
 
   const api = {
+    hasNativeCardStats,
+    cardStatsWrapper,
     CARD_SELECTOR,
     collectTradeCandidates,
     createAutoLootController,
     createChatCrystalController,
     createClubBoostController,
+    createClubBoostJournal,
     createCardObserver,
     createCardStatsCoordinator,
     createCardStatsClient,

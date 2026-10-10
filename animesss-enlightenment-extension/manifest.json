@@ -1,17 +1,40 @@
 {
   "manifest_version": 3,
   "name": "Animesss Просветление",
-  "version": "2.4.3",
+  "version": "2.7.22",
   "description": "Показывает спрос карточек и поддерживает просветление, авто-лут, авто-кристалл, авто-взнос клуба и массовый обмен.",
-  "permissions": ["storage"],
+  "permissions": ["storage", "alarms"],
+  "host_permissions": ["https://animesss.com/*", "https://animesss.tv/*", "https://labyrinthmap.uk/*"],
+  "background": { "service_worker": "background.js" },
   "content_scripts": [
+    {
+      "matches": ["https://animesss.com/boss_invansion/*", "https://animesss.tv/boss_invansion/*"],
+      "js": ["boss-key.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://animesss.com/labyrinth/*", "https://animesss.tv/labyrinth/*"],
+      "js": ["labyrinth-bridge.js"],
+      "world": "MAIN",
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://animesss.com/labyrinth/*", "https://animesss.tv/labyrinth/*"],
+      "js": ["labyrinth.js"],
+      "run_at": "document_idle"
+    },
     {
       "matches": [
         "https://animesss.com/*",
         "https://animesss.tv/*"
       ],
-      "js": ["card-helper.js", "content.js"],
+      "js": ["card-helper.js", "mobile-lock.js", "card-lock.js", "content.js"],
       "css": ["content.css"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://animesss.com/cards/pack/*", "https://animesss.tv/cards/pack/*"],
+      "css": ["pack-stats.css"],
       "run_at": "document_idle"
     }
   ]

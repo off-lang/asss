@@ -65,6 +65,8 @@
   display: grid;
   width: 170px;
   gap: 6px;
+  max-height: calc(100dvh - 124px);
+  overflow-y: auto;
 }
 
 #animesss-card-helper-actions[hidden] {
@@ -124,9 +126,10 @@
 .animesss-enlightenment-card-stats {
   display: grid;
   width: 100%;
-  margin-top: 5px;
+  margin-top: 3px;
   color: var(--tt, #eee);
   font: 500 11px/1.35 system-ui, sans-serif;
+  container-type: inline-size;
 }
 
 .animesss-card-stats-disabled .animesss-enlightenment-card-stats {
@@ -135,20 +138,67 @@
 
 .animesss-enlightenment-card-metrics {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 3px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0;
+  border: 1px solid var(--bdc, rgb(255 255 255 / 10%));
+  border-radius: 5px;
+  background: var(--bg-2, rgb(25 27 31 / 92%));
+  padding: 4px 0;
 }
 
 .animesss-enlightenment-card-metric {
   min-width: 0;
-  padding: 3px 4px;
-  border: 1px solid var(--bdc, rgb(255 255 255 / 18%));
-  border-radius: 5px;
-  background: var(--bg-2, rgb(25 27 31 / 92%));
+  padding: 0 2px;
+  display: flex;
+  justify-content: center;
+  align-content: start;
+  align-items: center;
+  gap: 2px;
+  border-right: 1px solid var(--bdc, rgb(255 255 255 / 8%));
   font: 600 11px/1.2 system-ui, sans-serif !important;
   text-align: center;
-  white-space: normal;
+  white-space: nowrap;
 }
+.animesss-enlightenment-card-metric:last-child {border-right: 0;}
+.animesss-enlightenment-card-metric i {font-size: 9px;opacity: 1;}
+.animesss-enlightenment-card-metric i.fa-users {color: #8eb8ed;}
+.animesss-enlightenment-card-metric i.fa-heart {color: #ee83ad;}
+.animesss-enlightenment-card-metric i.fa-sync-alt {color: #79cbb3;}
+.animesss-enlightenment-card-metric i.fa-copy {color: #d9ad67;}
+.animesss-enlightenment-card-metric b {font-size: 10px;min-width:0;font-variant-numeric:tabular-nums;}
+
+/* History thumbnails cannot fit four icon/count pairs on one line. */
+@container (max-width: 150px) {
+  .animesss-enlightenment-card-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    row-gap: 5px;
+  }
+  .animesss-enlightenment-card-metric:nth-child(2n) {border-right: 0;}
+}
+
+.animesss-club-journal {
+  width: min(850px, 90vw);
+  max-height: 85vh;
+  overflow: auto;
+  background: #202024;
+  color: #eee;
+  border: 1px solid #777;
+  border-radius: 12px;
+  padding: 20px;
+}
+.animesss-club-journal::backdrop { background: #0009; }
+.animesss-club-journal textarea {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  height: 45vh;
+  margin: 12px 0;
+  padding: 10px;
+  background: #111;
+  color: #eee;
+  font: 13px/1.5 monospace;
+}
+.animesss-club-journal button { margin: 4px; padding: 8px 12px; cursor: pointer; }
 
 @keyframes animesss-enlightenment-spin {
   to {

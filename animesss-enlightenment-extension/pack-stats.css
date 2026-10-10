@@ -1,0 +1,19 @@
+/* Injected only on /cards/pack/: larger counters for the three-card choice. */
+html .animesss-enlightenment-card-metrics {
+  padding: 6px 0;
+}
+html .animesss-enlightenment-card-metric {
+  gap: 4px;
+}
+html .animesss-enlightenment-card-metric i {
+  font-size: 12px;
+}
+html .animesss-enlightenment-card-metric b {
+  font-size: 13px;
+}
+/* Keep the compact layout on narrow mobile cards. */
+@container (max-width: 220px) {
+  html .animesss-enlightenment-card-metric {gap: 2px;}
+  html .animesss-enlightenment-card-metric i {font-size: 9px;}
+  html .animesss-enlightenment-card-metric b {font-size: 10px;}
+}

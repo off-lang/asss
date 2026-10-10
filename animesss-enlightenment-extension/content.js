@@ -4,6 +4,41 @@ function normalizeText(value) {
   return String(value || '').replace(/\s+/g, ' ').trim();
 }
 
+function dispatchClubBoostKey(target, KeyboardEventClass) {
+  const options = {
+    key: 's',
+    code: 'KeyS',
+    keyCode: 83,
+    which: 83,
+    bubbles: true,
+    cancelable: true,
+  };
+  target.dispatchEvent(new KeyboardEventClass('keydown', options));
+  target.dispatchEvent(new KeyboardEventClass('keyup', options));
+}
+
+function refreshClubBoostTask(doc) {
+  const button = doc.querySelector('.club__boost__refresh-btn');
+  if (!button || button.disabled || button.getClientRects().length === 0) return false;
+  button.click();
+  return true;
+}
+
+function performClubBoostAction(doc, KeyboardEventClass) {
+  // Prefer the site's explicit controls; never bypass its disabled state.
+  const donate = doc.querySelector('.club__boost-btn');
+  const refresh = doc.querySelector('.club__boost__refresh-btn');
+  for (const [button, action] of [[donate, 'вклад'], [refresh, 'обновить']]) {
+    if (button && button.getClientRects().length > 0) {
+      if (button.disabled || button.getAttribute('aria-disabled') === 'true') return 'ожидание: кнопка занята';
+      button.click();
+      return action;
+    }
+  }
+  dispatchClubBoostKey(doc, KeyboardEventClass);
+  return 'S';
+}
+
 function extractCardIds(doc) {
   const values = Array.from(
     doc.querySelectorAll('.anime-cards__item[data-id]'),
@@ -386,7 +421,17 @@ function createCardStatsRenderer(doc, origin) {
   function metric(label, value) {
     const item = doc.createElement('span');
     item.className = 'animesss-enlightenment-card-metric';
-    item.textContent = `${label}: ${value === null || value === undefined ? '—' : value}`;
+    const text=value === null || value === undefined ? '—' : String(value);
+    item.setAttribute('aria-label',`${label}: ${text}`);
+    item.setAttribute('role','img');item.setAttribute('title',`${label}: ${text}`);
+    const icon=doc.createElement('i');
+    icon.className='fas '+({Владельцы:'fa-users',Хотят:'fa-heart',Обмен:'fa-sync-alt',Дубли:'fa-copy'}[label]);
+    icon.setAttribute('aria-hidden','true');
+    const number=doc.createElement('b');
+    number.textContent=typeof value === 'number' && value >= 1000
+      ? new Intl.NumberFormat('ru', {notation:'compact',maximumFractionDigits:0}).format(value).replace(/\s/g,'').replace('тыс.','к').replace('млн','м') : text;
+    number.setAttribute('aria-hidden','true');
+    item.append(icon,number);
     return item;
   }
 
@@ -417,6 +462,9 @@ function createCardStatsRenderer(doc, origin) {
   }
 
   return function renderCardStats(cardOrId, rawData) {
+    // Enlightenment's legacy list results describe other owners, not personal
+    // copies. Only the dedicated stats coordinator owns this display.
+    if (rawData?.owners && rawData?.need && rawData?.trade) return;
     const directCard = cardOrId && typeof cardOrId === 'object'
       ? cardOrId
       : null;
@@ -427,11 +475,16 @@ function createCardStatsRenderer(doc, origin) {
     const data = normalizedCategoryData(rawData);
     for (const card of cards) {
       if (cardId !== null && card.getAttribute('data-id') !== cardId) continue;
+      if(globalThis.AnimesssCardHelper?.hasNativeCardStats(card)) {
+        const wrapper=globalThis.AnimesssCardHelper.cardStatsWrapper(card);
+        for(const block of wrapper.querySelectorAll('.animesss-enlightenment-card-stats'))block.remove();
+        continue;
+      }
       const isAccshopButton = String(card.className || '')
         .split(/\s+/)
         .includes('accshop__buy-btn');
       const shopProduct = isAccshopButton
-        ? card.closest('#accshopCardsWrap > *') || card.parentElement
+        ? card.closest('.accshop__card') || card.closest('#accshopCardsWrap > *') || card.parentElement
         : null;
       const wrapper = shopProduct ||
         card.closest('.anime-cards__item-wrapper') ||
@@ -602,7 +655,7 @@ function createChatCrystalToggle({ button, controller, log }) {
   return { initialize, toggle };
 }
 
-function createClubBoostToggle({ button, controller, log }) {
+function createClubBoostToggle({ button, controller, log, storageChanges }) {
   let enabled = false;
   let busy = false;
 
@@ -611,6 +664,15 @@ function createClubBoostToggle({ button, controller, log }) {
     button.textContent =
       `Авто-взнос клуба: ${enabled ? 'включён' : 'выключен'}`;
   }
+
+  storageChanges?.addListener((changes, area) => {
+    const change = changes['animesssCardHelper.clubBoostEnabled'];
+    if (area !== 'local' || !change) return;
+    try {
+      enabled = controller.syncEnabled(change.newValue === true);
+      render();
+    } catch (error) { log.error('Не удалось синхронизировать авто-взнос:', error); }
+  });
 
   async function initialize() {
     button.disabled = true;
@@ -642,6 +704,53 @@ function createClubBoostToggle({ button, controller, log }) {
   button.addEventListener('click', toggle);
   render();
   return { initialize, toggle };
+}
+
+function formatClubBoostJournal(entries) {
+  const moscow = (value) => new Date(value).toLocaleString('ru-RU', {
+    timeZone: 'Europe/Moscow', hour12: false,
+  });
+  return entries.map(({ time, event, ...details }) => {
+    for (const key of ['startAt', 'resumeAt']) {
+      if (details[key]) details[key] = moscow(details[key]) + ' МСК';
+    }
+    return `${moscow(time)} МСК — ${event}` +
+      (Object.keys(details).length ? '\n  ' + JSON.stringify(details) : '');
+  }).join('\n\n');
+}
+
+function mountClubBoostJournal(doc, button, journal) {
+  const dialog = doc.createElement('dialog');
+  dialog.className = 'animesss-club-journal';
+  dialog.setAttribute('aria-label', 'Журнал авто-взноса клуба');
+  const title = doc.createElement('h3');
+  title.textContent = 'Журнал авто-взноса · время МСК';
+  const help = doc.createElement('p');
+  help.textContent = 'Последние 500 событий. Отправка S и смена карты сами по себе не подтверждают успешный взнос. Текст можно выделить и скопировать.';
+  const output = doc.createElement('textarea');
+  output.readOnly = true;
+  output.setAttribute('aria-label', 'События авто-взноса');
+  const refresh = doc.createElement('button');
+  refresh.textContent = 'Обновить журнал';
+  const clear = doc.createElement('button');
+  clear.textContent = 'Очистить журнал';
+  const close = doc.createElement('button');
+  close.textContent = 'Закрыть';
+  for (const action of [refresh, clear, close]) action.type = 'button';
+  async function render() {
+    try {
+      output.value = formatClubBoostJournal(await journal.getEntries()) || 'Событий пока нет. Откройте страницу клуба после обновления расширения.';
+      output.scrollTop = output.scrollHeight;
+    } catch (error) {
+      output.value = 'Не удалось прочитать журнал: ' + String(error?.message || error);
+    }
+  }
+  button.addEventListener('click', () => { if (!dialog.open) dialog.showModal(); void render(); });
+  refresh.addEventListener('click', () => { void render(); });
+  clear.addEventListener('click', async () => { await journal.clear(); await render(); });
+  close.addEventListener('click', () => dialog.close());
+  dialog.append(title, help, output, refresh, clear, close);
+  doc.body.append(dialog);
 }
 
 function createCardStatsToggle({
@@ -847,6 +956,7 @@ function createStatsActions({
     clearButton.disabled = true;
     try {
       await cache.clear();
+      coordinator.clearRetained?.();
       notify('success', 'Кэш статистики очищен.');
     } catch (error) {
       log.error('Ошибка очистки кэша:', error);
@@ -925,6 +1035,12 @@ function mountUi(doc) {
   clubBoostButton.className = 'animesss-card-helper-action';
   clubBoostButton.setAttribute('aria-label', 'Переключить авто-взнос клуба');
 
+  const clubJournalButton = doc.createElement('button');
+  clubJournalButton.type = 'button';
+  clubJournalButton.className = 'animesss-card-helper-action';
+  clubJournalButton.textContent = 'Журнал авто-взноса';
+  clubJournalButton.setAttribute('aria-label', 'Открыть журнал авто-взноса');
+
   const tradeButton = doc.createElement('button');
   tradeButton.type = 'button';
   tradeButton.className = 'animesss-card-helper-action';
@@ -935,6 +1051,12 @@ function mountUi(doc) {
   clearCacheButton.className = 'animesss-card-helper-action';
   clearCacheButton.textContent = 'Очистить кэш';
   clearCacheButton.setAttribute('aria-label', 'Очистить кэш статистики');
+  const lockButtons = ['Блокировать все A', 'Отменить блок A', 'Журнал блокировок A'].map(label => {
+    const button = doc.createElement('button');
+    button.type = 'button'; button.className = 'animesss-card-helper-action';
+    button.textContent = label; button.setAttribute('aria-label', label);
+    return button;
+  });
 
   actions.append(
     enlightenmentButton,
@@ -944,7 +1066,9 @@ function mountUi(doc) {
     autoLootButton,
     autoCrystalButton,
     clubBoostButton,
+    clubJournalButton,
     tradeButton,
+    ...lockButtons,
     clearCacheButton,
   );
 
@@ -1003,6 +1127,7 @@ function mountUi(doc) {
   }
 
   return {
+    lockButton: lockButtons[0], unlockButton: lockButtons[1], lockJournalButton: lockButtons[2],
     button,
     enlightenmentButton,
     refreshButton,
@@ -1011,6 +1136,7 @@ function mountUi(doc) {
     autoLootButton,
     autoCrystalButton,
     clubBoostButton,
+    clubJournalButton,
     tradeButton,
     clearCacheButton,
     actions,
@@ -1028,6 +1154,9 @@ function mountExtension() {
   }
 
   const ui = mountUi(document);
+  globalThis.AnimesssCardLock?.mount({ui, getIdentity: () => ({
+    name: extractVisitorName(document), hash: globalThis.AnimesssCardHelper.extractUserHash(document),
+  })});
   const origin = window.location.origin;
   const renderCardStats = createCardStatsRenderer(document, origin);
   const cardHelper = globalThis.AnimesssCardHelper;
@@ -1066,7 +1195,7 @@ function mountExtension() {
     const statsCache = cardHelper.createTtlCache({
       storage: chrome.storage.local,
       now: Date.now,
-      prefix: 'animesssCardHelper.stats.',
+      prefix: `animesssCardHelper.stats.v3.${encodeURIComponent(origin)}.${encodeURIComponent(extractVisitorName(document))}.`,
       ttlMs: 24 * 60 * 60 * 1000,
     });
     const instanceStore = cardHelper.createInstanceMapStore({
@@ -1075,6 +1204,9 @@ function mountExtension() {
     });
     const statsClient = cardHelper.createCardStatsClient({
       origin,
+      collectionName: extractVisitorName(document),
+      collectionRank: document.querySelector('#tradeOffer')?.getAttribute('data-rank') || '',
+      instanceStore,
       fetch: window.fetch.bind(window),
       parseHtml: (html) =>
         new DOMParser().parseFromString(html, 'text/html'),
@@ -1125,8 +1257,16 @@ function mountExtension() {
     const chatCrystalController = cardHelper.createChatCrystalController({
       root: document.body,
       storage: chrome.storage.local,
-      setInterval: window.setInterval.bind(window),
-      clearInterval: window.clearInterval.bind(window),
+      // Chrome alarms wake the service worker even while this tab is inactive.
+      setInterval: (callback) => {
+        const listener = (message) => {
+          if (message?.type === 'animesss-check-crystal') callback();
+        };
+        chrome.runtime.onMessage.addListener(listener);
+        return listener;
+      },
+      clearInterval: (listener) => chrome.runtime.onMessage.removeListener(listener),
+      sleep: (ms) => new Promise(resolve => window.setTimeout(resolve, ms)),
     });
     const chatCrystalToggle = createChatCrystalToggle({
       button: ui.autoCrystalButton,
@@ -1134,13 +1274,28 @@ function mountExtension() {
       log: window.console,
     });
     void chatCrystalToggle.initialize();
+    const clubJournal = cardHelper.createClubBoostJournal({ storage: chrome.storage.local });
+    mountClubBoostJournal(document, ui.clubJournalButton, clubJournal);
     const clubBoostController = cardHelper.createClubBoostController({
+      journal: clubJournal,
+      refreshTask: () => refreshClubBoostTask(document),
+      reloadPage: () => window.location.reload(),
+      reloadStorage: {
+        get: async (key) => ({ [key]: window.sessionStorage.getItem(key) }),
+        set: async (values) => {
+          for (const [key, value] of Object.entries(values)) window.sessionStorage.setItem(key, value);
+        },
+      },
       root: document.body,
       storage: chrome.storage.local,
       now: Date.now,
       setTimeout: window.setTimeout.bind(window),
       clearTimeout: window.clearTimeout.bind(window),
-      sleep: (ms) => new Promise((resolve) => window.setTimeout(resolve, ms)),
+      sleep: async () => {
+        const reply = await chrome.runtime.sendMessage({type:'animesss-club-wait'});
+        if (!reply?.ok) throw new Error('Фоновый таймер авто-взноса недоступен. Обновите страницу.');
+      },
+      pressContributeKey: () => performClubBoostAction(document, window.KeyboardEvent),
       notify: ui.notify,
       isBoostPage: () =>
         window.location.pathname === '/clubs/boost/' &&
@@ -1150,8 +1305,18 @@ function mountExtension() {
       button: ui.clubBoostButton,
       controller: clubBoostController,
       log: window.console,
+      storageChanges: chrome.storage.onChanged,
     });
-    void clubBoostToggle.initialize();
+    const clubReady = clubBoostToggle.initialize();
+    chrome.runtime.onMessage.addListener((message, sender, reply) => {
+      if (message?.type !== 'animesss-club-watchdog' ||
+          window.location.pathname !== '/clubs/boost/' ||
+          new URLSearchParams(window.location.search).get('id') !== '402') return;
+      reply({accepted:true});
+      void clubReady.then(()=>clubBoostController.checkScheduledRun(message.minute)).catch(error=>{
+        void clubJournal.record('Ошибка контрольной проверки 21:05', {message:String(error?.message || error)});
+      });
+    });
     const massTradeController = cardHelper.createMassTradeController({
       fetch: window.fetch.bind(window),
       getUserHash: () => cardHelper.extractUserHash(document),
@@ -1210,6 +1375,11 @@ if (typeof module === 'object' && module.exports) {
     createAutoLootToggle,
     createChatCrystalToggle,
     createClubBoostToggle,
+    dispatchClubBoostKey,
+    performClubBoostAction,
+    refreshClubBoostTask,
+    formatClubBoostJournal,
+    mountClubBoostJournal,
     createCardStatsToggle,
     createCardStatsSpeedToggle,
     createMassTradeAction,
