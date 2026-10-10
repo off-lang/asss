@@ -13,6 +13,10 @@ const {
   createAutoLootToggle,
   createChatCrystalToggle,
   createClubBoostToggle,
+  dispatchClubBoostKey,
+  performClubBoostAction,
+  refreshClubBoostTask,
+  formatClubBoostJournal,
   createCardStatsToggle,
   createCardStatsSpeedToggle,
   createMassTradeAction,
@@ -20,6 +24,79 @@ const {
   createPersistentActivation,
   mountUi,
 } = require('../content.js');
+
+test('club actions prefer contribution, then refresh, and respect busy controls', () => {
+  const clicks=[];
+  const control=name=>({disabled:false,getClientRects:()=>[{}],getAttribute:()=>null,click:()=>clicks.push(name)});
+  let donate=control('donate'),refresh=control('refresh');
+  const doc={querySelector:selector=>selector === '.club__boost-btn'?donate:refresh,
+    dispatchEvent:event=>clicks.push(event.type)};
+  class Key {constructor(type){this.type=type;}}
+  assert.equal(performClubBoostAction(doc,Key),'вклад');
+  donate.disabled=true;
+  assert.equal(performClubBoostAction(doc,Key),'ожидание: кнопка занята');
+  donate=null;
+  assert.equal(performClubBoostAction(doc,Key),'обновить');
+  refresh=null;
+  assert.equal(performClubBoostAction(doc,Key),'S');
+  assert.deepEqual(clicks,['donate','refresh','keydown','keyup']);
+});
+
+test('club journal displays event times and planned start in Moscow time', () => {
+  const text = formatClubBoostJournal([{
+    time: '2026-09-07T18:00:00Z', event: 'Запуск', startAt: '2026-09-08T18:00:00Z',
+  }]);
+  assert.match(text, /07\.09\.2026.*21:00:00 МСК/);
+  assert.match(text, /08\.09\.2026.*21:00:00 МСК/);
+});
+
+test('closed-state refresh clicks only an available refresh control', () => {
+  let clicks = 0;
+  let button = null;
+  const doc = { querySelector(selector) {
+    assert.equal(selector, '.club__boost__refresh-btn');
+    return button;
+  } };
+  assert.equal(refreshClubBoostTask(doc), false);
+  button = { disabled: true, getClientRects: () => [1], click: () => clicks++ };
+  assert.equal(refreshClubBoostTask(doc), false);
+  button.disabled = false;
+  button.getClientRects = () => [];
+  assert.equal(refreshClubBoostTask(doc), false);
+  button.getClientRects = () => [1];
+  assert.equal(refreshClubBoostTask(doc), true);
+  assert.equal(clicks, 1);
+});
+
+test('dispatchClubBoostKey emits a complete S key press on the document', () => {
+  const events = [];
+  class FakeKeyboardEvent {
+    constructor(type, options) {
+      this.type = type;
+      Object.assign(this, options);
+    }
+  }
+  const target = {
+    dispatchEvent(event) {
+      events.push(event);
+      return true;
+    },
+  };
+
+  dispatchClubBoostKey(target, FakeKeyboardEvent);
+
+  assert.deepEqual(events.map((event) => event.type), ['keydown', 'keyup']);
+  assert.deepEqual(events.map((event) => ({
+    key: event.key,
+    code: event.code,
+    keyCode: event.keyCode,
+    which: event.which,
+    bubbles: event.bubbles,
+  })), [
+    { key: 's', code: 'KeyS', keyCode: 83, which: 83, bubbles: true },
+    { key: 's', code: 'KeyS', keyCode: 83, which: 83, bubbles: true },
+  ]);
+});
 
 function fakeDoc(selectorMap) {
   return {
@@ -600,8 +677,8 @@ test('card stats renderer keeps one compact block with no repeated categories', 
     need: { status: 'ready', count: 0, duplicates: 0, users: [] },
   };
 
-  render('42', data);
-  render('42', data);
+  render('42', {status:'ready',ownersCount:1,needCount:0,tradeCount:1,duplicates:2});
+  render('42', {status:'ready',ownersCount:1,needCount:0,tradeCount:1,duplicates:2});
 
   const blocks = wrapper.children.filter((child) =>
     child.className.includes('animesss-enlightenment-card-stats')
@@ -609,10 +686,9 @@ test('card stats renderer keeps one compact block with no repeated categories', 
   assert.equal(blocks.length, 1);
   assert.equal(blocks[0].children.length, 1);
   const text = collectText(blocks[0]);
-  assert.match(text, /Владельцы: 1.*Хотят: 0.*Обмен: 1.*Дубли: 2/);
-  for (const label of ['Владельцы', 'Хотят', 'Обмен', 'Дубли']) {
-    assert.equal(text.split(label).length - 1, 1);
-  }
+  assert.equal(text, '1 0 1 2');
+  assert.deepEqual(blocks[0].children[0].children.map(item=>item.getAttribute('aria-label')),
+    ['Владельцы: 1','Хотят: 0','Обмен: 1','Дубли: 2']);
   assert.doesNotMatch(text, /Alice|Bob/);
 });
 
@@ -644,7 +720,7 @@ test('card stats renderer accepts any card element and preserves valid metrics o
   assert.equal(blocks.length, 1);
   assert.match(
     collectText(blocks[0]),
-    /Владельцы: 8.*Хотят: —.*Обмен: 3.*Дубли: 1/,
+    /8.*—.*3.*1/,
   );
 });
 
@@ -671,7 +747,7 @@ test('card stats renderer places accshop statistics beside the buy button', () =
   });
 
   assert.equal(product.children.length, 1);
-  assert.match(collectText(product.children[0]), /Владельцы: 10.*Хотят: 2/);
+  assert.equal(collectText(product.children[0]), '10 2 3 0');
   assert.equal(buyButton.children.length, 0);
 });
 
@@ -738,6 +814,21 @@ test('auto-crystal toggle initializes disabled and persists clicks', async () =>
   assert.deepEqual(writes, [true]);
   assert.equal(attributes['aria-pressed'], 'true');
   assert.match(button.textContent, /включён/);
+});
+
+test('club toggle reflects settings from another tab and ignores unrelated storage events', () => {
+  let listener;const synced=[];const attrs={};
+  const button={addEventListener(){},setAttribute:(k,v)=>{attrs[k]=v;}};
+  createClubBoostToggle({button,log:console,storageChanges:{addListener:fn=>{listener=fn;}},
+    controller:{syncEnabled:value=>{synced.push(value);return value;}}});
+  listener({'animesssCardHelper.clubBoostEnabled':{newValue:true}},'local');
+  assert.equal(attrs['aria-pressed'],'true');
+  assert.match(button.textContent,/включён/);
+  listener({'unrelated':{newValue:false}},'local');
+  listener({'animesssCardHelper.clubBoostEnabled':{newValue:false}},'sync');
+  assert.deepEqual(synced,[true]);
+  listener({'animesssCardHelper.clubBoostEnabled':{newValue:false}},'local');
+  assert.equal(attrs['aria-pressed'],'false');
 });
 
 test('club boost toggle initializes from persistence and updates pressed state', async () => {
@@ -949,7 +1040,11 @@ test('mountUi creates a collapsed accessible panel with all card actions', () =>
       'Переключить авто-лут',
       'Переключить авто-кристалл',
       'Переключить авто-взнос клуба',
+      'Открыть журнал авто-взноса',
       'Запустить массовый обмен',
+      'Блокировать все A',
+      'Отменить блок A',
+      'Журнал блокировок A',
       'Очистить кэш статистики',
     ],
   );

@@ -1,0 +1,14 @@
+<!doctype html><html lang="ru"><meta charset="utf-8"><title>Проверка локальной карты</title>
+<body style="background:#171717;color:white;font-family:system-ui"><header><a href="/user/Test/">Коллекция</a></header>
+<h1>Тест карты — без игровых действий</h1><p>Данные искусственные. Страница не обращается к Animesss.</p>
+<button id="step">Добавить тестовую комнату</button>
+<script>
+window.chrome={runtime:{id:'test'},storage:{local:{
+  get:async key=>({[key]:JSON.parse(localStorage.getItem(key)||'null')}),
+  set:async value=>Object.entries(value).forEach(([key,data])=>localStorage.setItem(key,JSON.stringify(data)))
+}}};
+window.labyrinthData={mapData:{current:{x:286,y:-90},steps:Array.from({length:18},(_,i)=>({x:274+i,y:-90,event:['trap_back','empty','quiz','reward','mini_boss','spiritual_teleport'][i%6]}))}};
+document.getElementById('step').onclick=()=>{
+  const map=window.labyrinthData.mapData;map.current={x:286,y:map.current.y-1};map.steps.push({...map.current,event:'reward_card'});
+};
+</script><script src="/labyrinth-bridge.js"></script><script src="/labyrinth.js"></script></body></html>

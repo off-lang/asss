@@ -10,6 +10,7 @@ const {
   createAutoLootController,
   createChatCrystalController,
   createClubBoostController,
+  createClubBoostJournal,
   createInstanceMap,
   createInstanceMapStore,
   createMassTradeController,
@@ -163,6 +164,46 @@ test('parseCardStats uses authoritative counters and safe unique owners', () => 
   });
 });
 
+test('trade inventory instance ids are never used as canonical ids',()=>{
+  const card=fakeCard({className:'trade__inventory-item user__donthave__card',attrs:{'data-id':'178746853'}});
+  assert.equal(getCanonicalCardId(card),null);
+  assert.equal(getCanonicalCardId(card,id=>id==='178746853'?'3124':null),'3124');
+  assert.equal(getCanonicalCardId(fakeCard({className:'trade__inventory-item',attrs:{'data-id':'178746853','data-original-id':'25'}})),'25');
+});
+
+test('trade resolver indexes own collection pages and reuses all discovered mappings',async()=>{
+  const urls=[];
+  const store=createInstanceMapStore({storage:memoryStorage(),key:'instances'});
+  let page=0;
+  const client=createCardStatsClient({origin:'https://animesss.com',
+    collectionName:'Alex59',collectionRank:'b',instanceStore:store,
+    fetch:async url=>{urls.push(url);return {ok:true,text:async()=>''};},
+    parseHtml:()=>{page++;return {querySelectorAll:selector=>selector==='a[href]'
+      ? (page===1?[fakeCard({href:'/user/cards/?name=Alex59&page=2&rank=b'})]:[])
+      : [fakeCard({attrs:{'data-owner-id':page===1?'178746851':'178746853','data-id':page===1?'25':'3124'}})]};},
+    cache:{get:async()=>null,set:async()=>{}},sleep:async()=>{}});
+  assert.equal(await client.resolveInstance('178746853'),'3124');
+  assert.equal(await client.resolveInstance('178746851'),'25');
+  assert.equal(await client.resolveInstance('999999999'),null);
+  assert.equal(store.lookup('178746853'),'3124');
+  assert.deepEqual(urls,[
+    'https://animesss.com/user/cards/?name=Alex59&rank=b&page=1',
+    'https://animesss.com/user/cards/?name=Alex59&rank=b&page=2',
+  ]);
+});
+
+test('initial trade markup saves mappings before filtering removes data-card-id',async()=>{
+  const store=createInstanceMapStore({storage:memoryStorage(),key:'instances'});
+  await store.remember([fakeCard({className:'trade__inventory-item',attrs:{'data-id':'178746853','data-card-id':'3124'}})]);
+  assert.equal(getCanonicalCardId(fakeCard({className:'trade__inventory-item',attrs:{'data-id':'178746853'}}),store.lookup),'3124');
+});
+
+test('a page without card statistics does not become zero counts',()=>{
+  const stats=parseCardStats(statsDocument({}),'https://animesss.com');
+  assert.equal(stats.ownersCount,null);assert.equal(stats.needCount,null);
+  assert.equal(stats.tradeCount,null);assert.equal(stats.duplicates,null);
+});
+
 test('parseCardStats falls back to list size when counters are absent', () => {
   const doc = statsDocument({
     owners: [
@@ -173,9 +214,9 @@ test('parseCardStats falls back to list size when counters are absent', () => {
 
   const result = parseCardStats(doc, 'https://animesss.com');
   assert.equal(result.ownersCount, 2);
-  assert.equal(result.needCount, 0);
-  assert.equal(result.tradeCount, 0);
-  assert.equal(result.duplicates, 0);
+  assert.equal(result.needCount, null);
+  assert.equal(result.tradeCount, null);
+  assert.equal(result.duplicates, null, 'other users are not the signed-in user’s duplicates');
 });
 
 function memoryStorage(initial = {}) {
@@ -335,7 +376,7 @@ test('card stats client retries a transient 503 and does not retry a permanent 4
   assert.equal(permanentCalls, 1);
 });
 
-test('card stats client fetches missing need and trade lists without replacing main counters', async () => {
+test('card stats client uses main counters without requesting unused user lists', async () => {
   const urls = [];
   const partialStats = {
     ...completeStats,
@@ -377,14 +418,31 @@ test('card stats client fetches missing need and trade lists without replacing m
 
   assert.deepEqual(urls, [
     'https://animesss.com/cards/users/?id=17',
-    'https://animesss.com/cards/users/need/?id=17',
-    'https://animesss.com/cards/users/trade/?id=17',
   ]);
   assert.equal(result.ownersCount, 12);
   assert.equal(result.needCount, 7);
   assert.equal(result.tradeCount, 4);
-  assert.deepEqual(result.users.need, [needUser]);
-  assert.deepEqual(result.users.trade, [tradeUser]);
+  assert.deepEqual(result.users.need, []);
+  assert.deepEqual(result.users.trade, []);
+});
+
+test('coordinator renders main counters while the personal-copy request is pending', async () => {
+  let release, started;
+  const pending=new Promise(resolve=>{release=resolve;});
+  const personalStarted=new Promise(resolve=>{started=resolve;});
+  const updates=[];
+  const client=createCardStatsClient({origin:'https://animesss.com',collectionName:'Alex59',
+    fetch:async url=>{
+      if(url.includes('/user/cards/')){started();await pending;}
+      return httpResponse('MAIN');
+    },parseHtml:()=>({querySelector:()=>null}),
+    parseStats:()=>({...completeStats,duplicates:null,users:{owners:[],need:[],trade:[]}}),
+    cache:valueCache(),sleep:async()=>{}});
+  const coordinator=createCardStatsCoordinator({client,instanceStore:{lookup:()=>null,remember:async()=>{}},render:(_card,data)=>updates.push(data)});
+  const work=coordinator.process([fakeCard({className:'anime-cards__item',attrs:{'data-id':'17'}})]);
+  await personalStarted;
+  try {assert.equal(updates[0]?.needCount,7,'demand must display before duplicate response');}
+  finally {release();await work;}
 });
 
 test('card stats client spaces network requests for about three per second', async () => {
@@ -534,6 +592,12 @@ test('card observer schedules a card again when its ID changes', () => {
   }]);
   scheduled.shift()();
   assert.deepEqual(batches, [[changed]]);
+  for (const attributeName of ['data-card-id', 'card-id', 'data-original-id', 'data-owner-id', 'data-rank']) {
+    mutationCallback([{type:'attributes',attributeName,target:changed}]);
+    assert.equal(scheduled.length,1);
+    scheduled.shift()();
+  }
+  assert.equal(batches.length,6);
 });
 
 test('instance map store persists mappings and resolves them after reload', async () => {
@@ -590,7 +654,37 @@ test('card stats coordinator renders recognized cards and forwards force refresh
     ['17', { force: true }],
     ['88', { force: true }],
   ]);
-  assert.deepEqual(renders.map(([card]) => card), [regular, remelt]);
+  assert.deepEqual(renders.map(([card]) => card), [regular, remelt, unknown]);
+  assert.equal(renders.at(-1)[1].ownersCount,null);
+});
+
+test('filter replacement restores stats by exact card image without reloading or resolving instance',async()=>{
+  const image={getAttribute:name=>name==='src'?'/uploads/cards_image/197/b/ril.webp':null};
+  const before=fakeCard({className:'trade__inventory-item',attrs:{'data-id':'178746853','data-original-id':'42'}});
+  const after=fakeCard({className:'trade__inventory-item',attrs:{'data-id':'178746853'}});
+  before.querySelector=after.querySelector=selector=>selector.startsWith('img')?image:null;
+  let loads=0;const rendered=[];
+  const coordinator=createCardStatsCoordinator({instanceStore:{remember:async()=>{},lookup:()=>null},
+    client:{load:async()=>{loads++;return {status:'ready',needCount:167};},resolveInstance:()=>assert.fail('must reuse statistics')},
+    render:(card,data)=>rendered.push({card,data})});
+  await coordinator.process([before]);
+  const pending=coordinator.process([after]);
+  assert.equal(rendered.at(-1).card,after);
+  assert.equal(rendered.at(-1).data.needCount,167);
+  await pending;assert.equal(loads,1);
+  await coordinator.process([after],{force:true});assert.equal(loads,2);
+});
+
+test('failed forced refresh preserves previously loaded counts',async()=>{
+  const card=fakeCard({className:'deck__item',attrs:{'data-id':'42'}});
+  let calls=0;const rendered=[];
+  const coordinator=createCardStatsCoordinator({instanceStore:{remember:async()=>{},lookup:()=>null},
+    client:{load:async()=>++calls===1?{status:'ready',needCount:77}:{status:'error',needCount:null}},
+    render:(_,data)=>rendered.push(data)});
+  await coordinator.process([card]);await coordinator.process([card],{force:true});
+  assert.equal(rendered.at(-1).needCount,77);
+  coordinator.clearRetained();await coordinator.process([card]);
+  assert.equal(rendered.at(-1).status,'error');
 });
 
 test('disabling card stats stops queued cards after the active load', async () => {
@@ -733,14 +827,228 @@ test('auto-loot handles each dynamically added notification only once', async ()
   assert.equal(disconnected, true);
 });
 
-test('club boost waits until 21:00 Moscow when enabled before the target time', async () => {
+test('club journal serializes writes, retains 500 events, survives reload and clears only itself', async () => {
+  const storage = memoryStorage({ other: true });
+  const journal = createClubBoostJournal({ storage, now: () => Date.parse('2026-09-07T18:00:00Z') });
+  await Promise.all(Array.from({ length: 505 }, (_, attempt) => journal.record('attempt', { attempt })));
+  const reloaded = createClubBoostJournal({ storage });
+  const entries = await reloaded.getEntries();
+  assert.equal(entries.length, 500);
+  assert.equal(entries[0].attempt, 5);
+  assert.equal(entries.at(-1).attempt, 504);
+  assert.equal(entries[0].time, '2026-09-07T18:00:00.000Z');
+  await reloaded.clear();
+  assert.deepEqual(await reloaded.getEntries(), []);
+  assert.equal(storage.values.other, true);
+});
+
+test('club journal storage failures do not prevent future records', async () => {
+  const storage = memoryStorage();
+  const originalSet = storage.set;
+  let errors = 0;
+  storage.set = async () => { throw new Error('storage unavailable'); };
+  const journal = createClubBoostJournal({ storage, log: { error: () => { errors += 1; } } });
+  await journal.record('failed write');
+  storage.set = originalSet;
+  await journal.record('recovered');
+  assert.equal(errors, 1);
+  assert.equal((await journal.getEntries())[0].event, 'recovered');
+});
+
+test('club boost reloads a stale closed page at 21:01 before S, then resumes once', async () => {
+  let time = Date.parse('2026-09-07T18:00:59Z');
+  let closed = true;
+  let reloads = 0;
+  let presses = 0;
+  let card = 1;
+  const timers = [];
+  const events = [];
+  const session = memoryStorage();
+  const storage = memoryStorage({ 'animesssCardHelper.clubBoostEnabled': true });
+  const deps = {
+    storage, reloadStorage: session, now: () => time,
+    root: { querySelector(selector) {
+      if (selector.includes('progressbar')) return {
+        getAttribute: (name) => name === 'aria-valuemax' || closed ? '600' : '599',
+      };
+      return { getAttribute: () => String(card) };
+    } },
+    setTimeout: (callback, delay) => { timers.push({ callback, delay }); return timers.length; },
+    clearTimeout() {}, sleep: async (delay) => { time += delay; },
+    reloadPage: () => { reloads += 1; },
+    pressContributeKey: () => { presses += 1; card += 1; closed = true; },
+    journal: { record: async (event) => { events.push(event); } },
+    notify() {}, isBoostPage: () => true,
+  };
+  await createClubBoostController(deps).initialize();
+  assert.equal(timers[0].delay, 1000);
+  time += 1000;
+  await timers.shift().callback();
+  assert.equal(reloads, 1);
+  assert.equal(presses, 0);
+  assert.equal(session.values['animesssCardHelper.clubBoostReloadDate'], '2026-09-07');
+  assert.ok(events.includes('Перезагрузка страницы перед авто-взносом'));
+  closed = false;
+  await createClubBoostController(deps).initialize();
+  await timers.shift().callback();
+  assert.equal(reloads, 1);
+  assert.equal(presses, 1);
+  assert.ok(timers[0].delay > 23 * 60 * 60 * 1000);
+  // The next Moscow date requires another reload, even with stale 600/600.
+  time = Date.parse('2026-09-08T18:01:00Z');
+  await timers.shift().callback();
+  assert.equal(reloads, 2);
+  assert.equal(presses, 1);
+});
+
+test('club boost does not reload or press S after disabling the scheduled launch', async () => {
+  let callback;
+  let reloads = 0;
+  const controller = createClubBoostController({
+    root: { querySelector: () => null },
+    storage: memoryStorage({ 'animesssCardHelper.clubBoostEnabled': true }),
+    now: () => Date.parse('2026-09-07T18:01:00Z'),
+    setTimeout: (fn) => { callback = fn; return 1; }, clearTimeout() {},
+    reloadPage: () => { reloads += 1; }, isBoostPage: () => true,
+    notify() {}, sleep: async () => {},
+    pressContributeKey: () => assert.fail('must not press S'),
+  });
+  await controller.initialize();
+  await controller.setEnabled(false);
+  await callback();
+  assert.equal(reloads, 0);
+});
+
+test('full progress after daily reload stops refresh and contribution until next day', async () => {
+  let time = Date.parse('2026-09-07T18:01:01Z');
+  let progress = 600;
+  let refreshes = 0;
+  let presses = 0;
+  let id = 32610;
+  const timers = [];
+  const entries = [];
+  const controller = createClubBoostController({
+    now: () => time,
+    storage: memoryStorage({ 'animesssCardHelper.clubBoostEnabled': true }),
+    reloadStorage: memoryStorage({ 'animesssCardHelper.clubBoostReloadDate': '2026-09-07' }),
+    reloadPage: () => assert.fail('already reloaded'),
+    root: { querySelector(selector) {
+      if (selector.includes('progressbar')) return {
+        getAttribute: (name) => name === 'aria-valuenow' ? String(progress) : '600',
+      };
+      return { getAttribute: () => String(id) };
+    } },
+    setTimeout: (callback, delay) => { timers.push({ callback, delay }); return timers.length; },
+    clearTimeout() {}, sleep: async (ms) => { time += ms; },
+    refreshTask: () => { refreshes += 1; if (refreshes === 2) progress = 599; return true; },
+    pressContributeKey: () => { assert.equal(progress, 599); presses += 1; progress = 600; id += 1; },
+    journal: { record: (event, details) => entries.push({ event, ...details }) },
+    notify() {}, isBoostPage: () => true,
+  });
+  await controller.initialize();
+  await timers.shift().callback();
+  assert.equal(presses, 0);
+  assert.equal(refreshes, 0);
+  assert.ok(timers[0].delay > 23 * 60 * 60 * 1000);
+  const skipped = entries.find(e => e.event === 'Запуск пропущен');
+  assert.equal(skipped.progressCurrent, '600');
+  assert.equal(skipped.progressMaximum, '600');
+  assert.equal(skipped.cardId, '32610');
+  time = Date.parse('2026-09-07T19:30:00Z');
+  await timers.shift().callback();
+  assert.equal(refreshes, 0);
+  assert.equal(presses, 0);
+  assert.ok(timers[0].delay > 22 * 60 * 60 * 1000);
+});
+
+test('completed club day survives page reload even if page shows stale open progress', async () => {
+  const timers=[];
+  const controller=createClubBoostController({
+    now:()=>Date.parse('2026-09-07T18:30:00Z'),
+    storage:memoryStorage({'animesssCardHelper.clubBoostEnabled':true,
+      'animesssCardHelper.clubBoostCompletedDate':'2026-09-07'}),
+    root:{querySelector:()=>null},isBoostPage:()=>true,
+    setTimeout:(fn,ms)=>{timers.push(ms);return 1;},clearTimeout(){},
+    sleep:async()=>{},notify(){},pressContributeKey:()=>assert.fail('completed today'),
+  });
+  await controller.initialize();
+  assert.equal(await controller.runNow(),false);
+  assert.equal(timers[0],(23*60+31)*60000);
+});
+
+test('club tab schedules external enable and cancels external disable without writing settings', async () => {
+  let time=Date.parse('2026-09-10T14:43:25Z');const timers=[],cancelled=[];
+  const storage=memoryStorage({'animesssCardHelper.clubBoostEnabled':false});
+  const controller=createClubBoostController({storage,root:{querySelector:()=>null},now:()=>time,
+    setTimeout:(callback,delay)=>{timers.push({callback,delay});return timers.length;},
+    clearTimeout:id=>cancelled.push(id),sleep:async()=>{},isBoostPage:()=>true,notify(){},
+    pressContributeKey:()=>assert.fail('disabled scheduled run must not act')});
+  await controller.initialize();assert.equal(timers.length,0);
+  time=Date.parse('2026-09-10T15:00:30Z');
+  controller.syncEnabled(true);
+  assert.equal(timers[0].delay,Date.parse('2026-09-10T18:01:00Z')-time);
+  controller.syncEnabled(true);assert.equal(timers.length,1);
+  controller.syncEnabled(false);assert.deepEqual(cancelled,[1]);
+  time=Date.parse('2026-09-10T18:01:00Z');await timers[0].callback();
+  assert.equal(storage.values['animesssCardHelper.clubBoostEnabled'],false);
+});
+
+test('external setting during initialization wins over stale storage snapshot', async () => {
+  let release;const timers=[];
+  const controller=createClubBoostController({
+    storage:{get:key=>key.includes('Enabled')?new Promise(resolve=>{release=()=>resolve({[key]:false});}):Promise.resolve({})},
+    root:{querySelector:()=>null},now:()=>Date.parse('2026-09-10T18:10:00Z'),
+    setTimeout:(fn,ms)=>{timers.push(ms);return 1;},clearTimeout(){},isBoostPage:()=>true,notify(){}});
+  const pending=controller.initialize();controller.syncEnabled(true);release();
+  assert.equal(await pending,true);assert.deepEqual(timers,[0]);
+});
+
+test('21:05 watchdog restarts a missed launch but does not repeat a completed day',async()=>{
+  let time=Date.parse('2026-09-11T17:00:00Z'),presses=0,progress=599;
+  const events=[];
+  const controller=createClubBoostController({
+    storage:memoryStorage({'animesssCardHelper.clubBoostEnabled':true}),
+    root:{querySelector:selector=>selector.includes('progressbar')?{getAttribute:k=>k==='aria-valuenow'?String(progress):'600'}:null},
+    now:()=>time,setTimeout:()=>1,clearTimeout(){},sleep:async()=>{},notify(){},isBoostPage:()=>true,
+    pressContributeKey:()=>{presses++;progress=600;},journal:{record:(event,data)=>events.push({event,...data})}});
+  await controller.initialize();
+  await controller.checkScheduledRun();assert.equal(presses,0);
+  time=Date.parse('2026-09-11T18:05:00Z');await controller.checkScheduledRun();
+  assert.equal(presses,1);
+  await controller.checkScheduledRun();assert.equal(presses,1);
+  assert.equal(events.at(-1).retry,false);
+});
+
+test('initial 600 at 21:01 allows fresh reloads at 21:02 and 21:03 before starting',async()=>{
+  let time=Date.parse('2026-09-13T18:01:02Z'),progress=600,reloads=0,presses=0;
+  const storage=memoryStorage({'animesssCardHelper.clubBoostEnabled':true});
+  const session=memoryStorage({'animesssCardHelper.clubBoostReloadDate':'2026-09-13'});
+  const deps={storage,reloadStorage:session,reloadPage:()=>{reloads++;},
+    now:()=>time,root:{querySelector:s=>s.includes('progressbar')?{getAttribute:k=>k==='aria-valuenow'?String(progress):'600'}:null},
+    setTimeout:()=>1,clearTimeout(){},sleep:async()=>{},isBoostPage:()=>true,notify(){},
+    pressContributeKey:()=>{presses++;progress=600;}};
+  let controller=createClubBoostController(deps);await controller.initialize();await controller.runNow();
+  assert.equal(storage.values['animesssCardHelper.clubBoostCompletedDate'],undefined);
+  time=Date.parse('2026-09-13T18:02:00Z');await controller.checkScheduledRun(2);
+  assert.equal(reloads,1);assert.equal(presses,0);
+  controller=createClubBoostController(deps);await controller.initialize();await controller.runNow();
+  await controller.checkScheduledRun(2);assert.equal(reloads,1);
+  time=Date.parse('2026-09-13T18:03:00Z');await controller.checkScheduledRun(3);
+  assert.equal(reloads,2);
+  progress=599;controller=createClubBoostController(deps);await controller.initialize();await controller.runNow();
+  assert.equal(presses,1);
+  assert.equal(storage.values['animesssCardHelper.clubBoostCompletedDate'],'2026-09-13');
+  await controller.checkScheduledRun(3);assert.equal(reloads,2);assert.equal(presses,1);
+});
+
+test('club boost waits until 21:01 Moscow when enabled before the target time', async () => {
   const timers = [];
   const controller = createClubBoostController({
     root: { querySelector: () => null },
     storage: memoryStorage({
       'animesssCardHelper.clubBoostEnabled': true,
     }),
-    now: () => Date.parse('2026-09-01T17:59:59Z'),
+    now: () => Date.parse('2026-09-01T18:00:59Z'),
     setTimeout: (callback, delay) => {
       timers.push([callback, delay]);
       return timers.length;
@@ -756,220 +1064,109 @@ test('club boost waits until 21:00 Moscow when enabled before the target time', 
   assert.equal(timers[0][1], 1000);
 });
 
-test('club boost refreshes and contributes no more than 20 cards in total', async () => {
-  let refreshClicks = 0;
-  let contributeClicks = 0;
+test('club boost presses S more than 20 times and counts only changed cards', async () => {
+  let currentTime = Date.parse('2026-09-01T18:01:00Z');
+  let cardId = 100;
+  let progressValue = 0;
+  let keyPresses = 0;
   const delays = [];
-  const progress = {
-    getAttribute(name) {
-      if (name === 'aria-valuenow') return '0';
-      if (name === 'aria-valuemax') return '50';
-      return null;
-    },
-  };
-  const root = {
-    querySelector(selector) {
-      if (selector.includes('progressbar')) return progress;
-      if (selector.includes('club__boost__refresh-btn')) {
-        return { click: () => { refreshClicks += 1; } };
-      }
-      if (selector.includes('club__boost-btn')) {
-        return { click: () => { contributeClicks += 1; } };
-      }
-      return null;
-    },
-  };
-  const storage = memoryStorage({
-    'animesssCardHelper.clubBoostEnabled': true,
-  });
-  const controller = createClubBoostController({
-    root,
-    storage,
-    now: () => Date.parse('2026-09-01T18:00:00Z'),
-    setTimeout: () => 1,
-    clearTimeout: () => {},
-    sleep: async (delay) => { delays.push(delay); },
-    notify: () => {},
-    isBoostPage: () => true,
-  });
-  await controller.initialize();
-
-  assert.deepEqual(await controller.runNow(), {
-    contributed: 20,
-    limit: 20,
-  });
-  assert.equal(refreshClicks, 20);
-  assert.equal(contributeClicks, 20);
-  assert.deepEqual(delays.slice(0, 2), [300, 800]);
-  assert.equal(delays.length, 40);
-  assert.deepEqual(
-    storage.values['animesssCardHelper.clubBoostDailyStateV2'],
-    { date: '2026-09-01', count: 20 },
-  );
-});
-
-test('club boost resumes the saved Moscow-day total after reload', async () => {
-  let refreshClicks = 0;
-  let contributeClicks = 0;
   const root = {
     querySelector(selector) {
       if (selector.includes('progressbar')) {
         return {
-          getAttribute: (name) => name === 'aria-valuemax' ? '20' : '0',
+          getAttribute: (name) => name === 'aria-valuenow'
+            ? String(progressValue)
+            : '21',
         };
       }
-      if (selector.includes('club__boost__refresh-btn')) {
-        return { click: () => { refreshClicks += 1; } };
-      }
-      if (selector.includes('club__boost-btn')) {
-        return { click: () => { contributeClicks += 1; } };
+      if (selector.includes('data-card-id')) {
+        return {
+          getAttribute: () => String(cardId),
+        };
       }
       return null;
     },
   };
-  const storage = memoryStorage({
-    'animesssCardHelper.clubBoostEnabled': true,
-    'animesssCardHelper.clubBoostDailyStateV2': {
-      date: '2026-09-01',
-      count: 19,
-    },
-  });
   const controller = createClubBoostController({
     root,
-    storage,
-    now: () => Date.parse('2026-09-01T18:00:00Z'),
+    storage: memoryStorage({
+      'animesssCardHelper.clubBoostEnabled': true,
+      'animesssCardHelper.clubBoostDailyStateV2': {
+        date: '2026-09-01',
+        count: 20,
+      },
+    }),
+    now: () => currentTime,
     setTimeout: () => 1,
     clearTimeout: () => {},
-    sleep: async () => {},
+    sleep: async (delay) => {
+      delays.push(delay);
+      currentTime += delay;
+    },
+    pressContributeKey: () => {
+      keyPresses += 1;
+      cardId += 1;
+      progressValue += 1;
+    },
     notify: () => {},
     isBoostPage: () => true,
   });
   await controller.initialize();
 
-  assert.deepEqual(await controller.runNow(), {
-    contributed: 20,
-    limit: 20,
-  });
-  assert.equal(refreshClicks, 1);
-  assert.equal(contributeClicks, 1);
+  assert.deepEqual(await controller.runNow(), { contributed: 21 });
+  assert.equal(keyPresses, 21);
+  assert.deepEqual(delays, Array(21).fill(500));
 });
 
-test('club boost ignores lifetime site progress when enforcing the daily limit', async () => {
-  let refreshClicks = 0;
-  let contributeClicks = 0;
+test('club boost retries unchanged cards every 0.5 seconds until full', async () => {
+  const events = [];
+  let currentTime = Date.parse('2026-09-01T18:01:00Z');
+  let progressValue = 0;
+  let keyPresses = 0;
+  const delays = [];
   const root = {
     querySelector(selector) {
       if (selector.includes('progressbar')) {
         return {
-          getAttribute: (name) => name === 'aria-valuemax' ? '100' : '20',
+          getAttribute: (name) => name === 'aria-valuenow'
+            ? String(progressValue)
+            : '600',
         };
       }
-      if (selector.includes('club__boost__refresh-btn')) {
-        return { click: () => { refreshClicks += 1; } };
-      }
-      if (selector.includes('club__boost-btn')) {
-        return { click: () => { contributeClicks += 1; } };
+      if (selector.includes('data-card-id')) {
+        return { getAttribute: () => 'unchanged-card' };
       }
       return null;
     },
   };
-  const storage = memoryStorage({
-    'animesssCardHelper.clubBoostEnabled': true,
-    'animesssCardHelper.clubBoostDailyStateV2': {
-      date: '2026-09-01',
-      count: 0,
-    },
-  });
   const controller = createClubBoostController({
+    journal: { record: (event, details) => events.push({ event, ...details }) },
     root,
-    storage,
-    now: () => Date.parse('2026-09-01T18:00:00Z'),
+    storage: memoryStorage({
+      'animesssCardHelper.clubBoostEnabled': true,
+    }),
+    now: () => currentTime,
     setTimeout: () => 1,
     clearTimeout: () => {},
-    sleep: async () => {},
+    sleep: async (delay) => {
+      delays.push(delay);
+      currentTime += delay;
+      if (delays.length === 3) progressValue = 600;
+    },
+    pressContributeKey: () => { keyPresses += 1; },
     notify: () => {},
     isBoostPage: () => true,
   });
   await controller.initialize();
 
-  assert.deepEqual(await controller.runNow(), {
-    contributed: 20,
-    limit: 20,
-  });
-  assert.equal(refreshClicks, 20);
-  assert.equal(contributeClicks, 20);
-});
-
-test('club boost resets its own 20-card counter on a new Moscow date', async () => {
-  let contributeClicks = 0;
-  const root = {
-    querySelector(selector) {
-      if (selector.includes('club__boost__refresh-btn')) return { click() {} };
-      if (selector.includes('club__boost-btn')) {
-        return { click: () => { contributeClicks += 1; } };
-      }
-      return null;
-    },
-  };
-  const storage = memoryStorage({
-    'animesssCardHelper.clubBoostEnabled': true,
-    'animesssCardHelper.clubBoostDailyStateV2': {
-      date: '2026-08-31',
-      count: 20,
-    },
-  });
-  const controller = createClubBoostController({
-    root,
-    storage,
-    now: () => Date.parse('2026-09-01T18:00:00Z'),
-    setTimeout: () => 1,
-    clearTimeout: () => {},
-    sleep: async () => {},
-    notify: () => {},
-    isBoostPage: () => true,
-  });
-  await controller.initialize();
-  await controller.runNow();
-
-  assert.equal(contributeClicks, 20);
-  assert.deepEqual(
-    storage.values['animesssCardHelper.clubBoostDailyStateV2'],
-    { date: '2026-09-01', count: 20 },
-  );
-});
-
-test('club boost ignores the legacy counter populated from lifetime progress', async () => {
-  let contributeClicks = 0;
-  const root = {
-    querySelector(selector) {
-      if (selector.includes('club__boost__refresh-btn')) return { click() {} };
-      if (selector.includes('club__boost-btn')) {
-        return { click: () => { contributeClicks += 1; } };
-      }
-      return null;
-    },
-  };
-  const storage = memoryStorage({
-    'animesssCardHelper.clubBoostEnabled': true,
-    'animesssCardHelper.clubBoostState': {
-      date: '2026-09-01',
-      count: 20,
-    },
-  });
-  const controller = createClubBoostController({
-    root,
-    storage,
-    now: () => Date.parse('2026-09-01T18:00:00Z'),
-    setTimeout: () => 1,
-    clearTimeout: () => {},
-    sleep: async () => {},
-    notify: () => {},
-    isBoostPage: () => true,
-  });
-  await controller.initialize();
-  await controller.runNow();
-
-  assert.equal(contributeClicks, 20);
+  assert.deepEqual(await controller.runNow(), { contributed: 0 });
+  assert.equal(keyPresses, 3);
+  assert.deepEqual(delays, [500,500,500]);
+  assert.equal(events[3].cardId, 'unchanged-card');
+  const stopped = events.find(e => e.event === 'Цикл остановлен');
+  assert.equal(stopped.reason, 'клуб заполнен');
+  assert.equal(stopped.attempts, 3);
+  assert.equal(stopped.observedChanges, 0);
 });
 
 test('club boost schedules the next day when initialized after 22:30 Moscow', async () => {
@@ -992,20 +1189,16 @@ test('club boost schedules the next day when initialized after 22:30 Moscow', as
 
   await controller.initialize();
   assert.equal(timers.length, 1);
-  assert.equal(timers[0][1], 80940000);
+  assert.equal(timers[0][1], 81000000);
 });
 
 test('club boost stops before the next contribution when 22:30 Moscow arrives', async () => {
   let currentTime = Date.parse('2026-09-01T19:29:59.900Z');
-  let refreshClicks = 0;
-  let contributeClicks = 0;
+  let keyPresses = 0;
   const root = {
     querySelector(selector) {
-      if (selector.includes('club__boost__refresh-btn')) {
-        return { click: () => { refreshClicks += 1; } };
-      }
-      if (selector.includes('club__boost-btn')) {
-        return { click: () => { contributeClicks += 1; } };
+      if (selector.includes('data-card-id')) {
+        return { getAttribute: () => 'same-card' };
       }
       return null;
     },
@@ -1021,77 +1214,24 @@ test('club boost stops before the next contribution when 22:30 Moscow arrives', 
     sleep: async (delay) => {
       currentTime += delay;
     },
+    pressContributeKey: () => { keyPresses += 1; },
     notify: () => {},
     isBoostPage: () => true,
   });
   await controller.initialize();
 
-  assert.deepEqual(await controller.runNow(), {
-    contributed: 0,
-    limit: 20,
-  });
-  assert.equal(refreshClicks, 1);
-  assert.equal(contributeClicks, 0);
+  assert.deepEqual(await controller.runNow(), { contributed: 0 });
+  assert.equal(keyPresses, 1);
 });
 
-test('club boost does not schedule or click when the club progress is closed', async () => {
+test('club boost schedules a check but does not press S when the club progress is closed', async () => {
   const timers = [];
-  let clicks = 0;
+  let keyPresses = 0;
   const root = {
     querySelector(selector) {
       if (selector.includes('progressbar')) {
         return {
           getAttribute: (name) => name === 'aria-valuenow' ? '600' : '600',
-        };
-      }
-      return { click: () => { clicks += 1; } };
-    },
-  };
-  const controller = createClubBoostController({
-    root,
-    storage: memoryStorage({
-      'animesssCardHelper.clubBoostEnabled': true,
-    }),
-    now: () => Date.parse('2026-09-01T18:00:00Z'),
-    setTimeout: (callback, delay) => {
-      timers.push([callback, delay]);
-      return timers.length;
-    },
-    clearTimeout: () => {},
-    sleep: async () => {},
-    notify: () => {},
-    isBoostPage: () => true,
-  });
-
-  await controller.initialize();
-  assert.equal(timers.length, 0);
-  assert.equal(await controller.runNow(), false);
-  assert.equal(clicks, 0);
-});
-
-test('club boost stops its active loop as soon as progress reaches its maximum', async () => {
-  let currentProgress = 599;
-  let refreshClicks = 0;
-  let contributeClicks = 0;
-  let scheduledTimers = 0;
-  const root = {
-    querySelector(selector) {
-      if (selector.includes('progressbar')) {
-        return {
-          getAttribute: (name) => name === 'aria-valuenow'
-            ? String(currentProgress)
-            : '600',
-        };
-      }
-      if (selector.includes('club__boost__refresh-btn')) {
-        return { click: () => { refreshClicks += 1; } };
-      }
-      if (selector.includes('club__boost-btn')) {
-        return {
-          click: () => {
-            contributeClicks += 1;
-            currentProgress = 600;
-          },
         };
       }
       return null;
@@ -1102,25 +1242,69 @@ test('club boost stops its active loop as soon as progress reaches its maximum',
     storage: memoryStorage({
       'animesssCardHelper.clubBoostEnabled': true,
     }),
-    now: () => Date.parse('2026-09-01T18:00:00Z'),
+    now: () => Date.parse('2026-09-01T18:01:00Z'),
+    setTimeout: (callback, delay) => {
+      timers.push([callback, delay]);
+      return timers.length;
+    },
+    clearTimeout: () => {},
+    sleep: async () => {},
+    pressContributeKey: () => { keyPresses += 1; },
+    notify: () => {},
+    isBoostPage: () => true,
+  });
+
+  await controller.initialize();
+  assert.equal(timers.length, 1);
+  assert.equal(await controller.runNow(), false);
+  assert.equal(keyPresses, 0);
+});
+
+test('club boost stops its active loop as soon as progress reaches its maximum', async () => {
+  let currentProgress = 599;
+  let cardId = 1;
+  let keyPresses = 0;
+  let scheduledTimers = 0;
+  const root = {
+    querySelector(selector) {
+      if (selector.includes('progressbar')) {
+        return {
+          getAttribute: (name) => name === 'aria-valuenow'
+            ? String(currentProgress)
+            : '600',
+        };
+      }
+      if (selector.includes('data-card-id')) {
+        return { getAttribute: () => String(cardId) };
+      }
+      return null;
+    },
+  };
+  const controller = createClubBoostController({
+    root,
+    storage: memoryStorage({
+      'animesssCardHelper.clubBoostEnabled': true,
+    }),
+    now: () => Date.parse('2026-09-01T18:01:00Z'),
     setTimeout: () => {
       scheduledTimers += 1;
       return scheduledTimers;
     },
     clearTimeout: () => {},
     sleep: async () => {},
+    pressContributeKey: () => {
+      keyPresses += 1;
+      cardId += 1;
+      currentProgress = 600;
+    },
     notify: () => {},
     isBoostPage: () => true,
   });
   await controller.initialize();
 
-  assert.deepEqual(await controller.runNow(), {
-    contributed: 1,
-    limit: 20,
-  });
-  assert.equal(refreshClicks, 1);
-  assert.equal(contributeClicks, 1);
-  assert.equal(scheduledTimers, 1);
+  assert.deepEqual(await controller.runNow(), { contributed: 1 });
+  assert.equal(keyPresses, 1);
+  assert.equal(scheduledTimers, 2);
 });
 
 const CRYSTAL_MESSAGE =
@@ -1185,6 +1369,23 @@ function crystalFixture({
   });
   return { controller, storage, timers, cleared };
 }
+
+test('auto-crystal collects messages loaded asynchronously after resuming idle chat', async () => {
+  const item = chatItem();
+  let loaded = false;
+  let resumed = false;
+  const controller = createChatCrystalController({
+    root: { querySelectorAll(selector) {
+      if (selector === '.animesss-chat__item') return loaded ? [item] : [];
+      return [{ textContent: 'Я вернулся', offsetParent: {}, click: () => { resumed = true; } }];
+    } },
+    storage: memoryStorage({ 'animesssCardHelper.autoCrystalEnabled': true }),
+    setInterval: () => 1, clearInterval() {},
+    sleep: async () => { assert.equal(resumed, true); loaded = true; },
+  });
+  await controller.initialize();
+  assert.equal(item.getClicks(), 1);
+});
 
 test('auto-crystal stays disabled by default', async () => {
   const item = chatItem();
